@@ -1,0 +1,7 @@
+{
+  "uuid": "rtux@justinstimatze.com",
+  "name": "rtux pressure indicator",
+  "description": "Ambient top-bar memory-pressure light for rtux, plus the attention feed. Quiet green when you have headroom, amber then red as memory pressure rises; click to open the rtux control window. Reads kernel PSI directly and asynchronously — it never blocks the shell. Also tells the daemon which window has focus (the shell is the only thing that can see this on Wayland) so the app you're using stays resident under pressure.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/justinstimatze/rtux"
+}

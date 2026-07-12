@@ -1,0 +1,6 @@
+#!/bin/bash
+# Pre-commit hook: run the exact same check suite CI runs (scripts/check.sh), so
+# nothing that fails CI can be committed locally. Enable once with:
+#     git config core.hooksPath .githooks
+# Skip for a single commit (e.g. a WIP checkpoint) with:  git commit --no-verify
+exec "$(git rev-parse --show-toplevel)/scripts/check.sh"

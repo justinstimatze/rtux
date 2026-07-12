@@ -1,0 +1,19 @@
+[Unit]
+Description=pressured — PSI-driven desktop responsiveness daemon
+Documentation=https://github.com/justinstimatze/rtux
+After=graphical.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pressured daemon
+Restart=on-failure
+RestartSec=5
+# The protector must never be chosen as an OOM victim.
+OOMScoreAdjust=-1000
+# mlockall (CAP_IPC_LOCK) + raising our own limits if needed (CAP_SYS_RESOURCE).
+AmbientCapabilities=CAP_IPC_LOCK CAP_SYS_RESOURCE
+# Keep our own footprint bounded — the daemon stays tiny.
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target

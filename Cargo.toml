@@ -1,0 +1,48 @@
+[package]
+name = "pressured"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop responsiveness daemon — protects your UI under memory pressure"
+license = "MIT"
+repository = "https://github.com/justinstimatze/rtux"
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+nix = { version = "0.29", features = ["signal", "process", "user", "fs", "socket"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# GUI HUD only — isolated behind the `hud` feature so the daemon stays GTK-free.
+gtk4 = { version = "0.9", optional = true }
+# libadwaita for native GNOME chrome + styling (pairs with gtk4 0.9). Needs the
+# libadwaita-1-dev system lib (packaged on Ubuntu/Arch/Fedora/Nix alike).
+libadwaita = { version = "0.7", optional = true, features = ["v1_5"] }
+# Tray indicator only — pure-Rust StatusNotifierItem (zbus), no system D-Bus deps.
+ksni = { version = "0.3", optional = true, features = ["blocking"] }
+
+[features]
+hud = ["dep:gtk4", "dep:libadwaita"]
+tray = ["dep:ksni"]
+
+# Daemon + ctl client (no GUI deps).
+[[bin]]
+name = "pressured"
+path = "src/main.rs"
+
+# Hotkey-summoned GTK4 control window (built only with --features hud).
+[[bin]]
+name = "pressured-hud"
+path = "src/bin/pressured-hud.rs"
+required-features = ["hud"]
+
+# Top-bar pressure indicator via StatusNotifierItem (built only with --features tray).
+[[bin]]
+name = "pressured-tray"
+path = "src/bin/pressured-tray.rs"
+required-features = ["tray"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

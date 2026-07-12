@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # tags, so build.rs's `git describe` works
+
+      - name: Install system deps (GTK4 + libadwaita for the HUD)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # The exact same suite the local pre-commit hook runs (scripts/check.sh):
+      # fmt (advisory), clippy, daemon-only build, full hud+tray build, tests.
+      # Keeping both on one script is what stops local and CI strictness drifting.
+      - name: Checks (clippy, builds, tests)
+        run: ./scripts/check.sh

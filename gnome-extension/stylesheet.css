@@ -1,0 +1,7 @@
+.rtux-dot {
+    font-size: 13px;
+    padding: 0 6px;
+}
+.rtux-good { color: #6cc04a; }
+.rtux-warn { color: #e0a53b; }
+.rtux-crit { color: #e2504a; }
