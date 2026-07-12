@@ -1,0 +1,461 @@
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::thread;
+
+use serde::{Deserialize, Serialize};
+
+use crate::{actions, cgroup, guard, mitigate, notify, psi};
+
+pub const SOCKET_PATH: &str = "/run/pressured.sock";
+const LIST_MIN_BYTES: u64 = 100 * 1024 * 1024; // surface apps >= 100 MB
+const CGROUP_BASE: &str = "/sys/fs/cgroup";
+
+#[derive(Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum Request {
+    List,
+    Act { action: String, id: String },
+    /// The HUD asks to be pinned into the reserved control plane (kept resident +
+    /// OOM-protected) so it stays operable under load. The pid in the JSON is
+    /// ignored — we trust the kernel's SO_PEERCRED peer instead (see handle()).
+    #[allow(dead_code)]
+    PinSelf { pid: i32 },
+    /// A focus tracker reports the newly-focused window's pid. The daemon pins
+    /// that app resident (clamped) and relaxes the previous foreground — so the
+    /// window you're in is always instant. Client-agnostic (shell ext, tray,
+    /// AT-SPI, …).
+    Foreground { pid: i32 },
+}
+
+#[derive(Serialize)]
+struct App {
+    id: String,
+    name: String,
+    mem_bytes: u64,
+    swap_bytes: u64,
+    frozen: bool,
+    protected: bool,
+    freezable: bool,
+    flagged: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RecentEvent {
+    ago_secs: u64,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct ListReply {
+    ok: bool,
+    some_avg10: f64,
+    full_avg10: f64,
+    mem_used: u64,
+    mem_total: u64,
+    swap_used: u64,
+    swap_total: u64,
+    apps: Vec<App>,
+    recent: Vec<RecentEvent>,
+    /// Rolling PSI some.avg10 history (oldest-first) for the HUD sparkline.
+    pressure_trend: Vec<f64>,
+}
+
+/// (used, total) for RAM and swap, from /proc/meminfo (bytes).
+fn mem_swap() -> (u64, u64, u64, u64) {
+    let (mut mt, mut ma, mut st, mut sf) = (0u64, 0u64, 0u64, 0u64);
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines() {
+            let Some((k, v)) = line.split_once(':') else { continue };
+            let kb: u64 = v.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+            match k.trim() {
+                "MemTotal" => mt = kb * 1024,
+                "MemAvailable" => ma = kb * 1024,
+                "SwapTotal" => st = kb * 1024,
+                "SwapFree" => sf = kb * 1024,
+                _ => {}
+            }
+        }
+    }
+    (mt.saturating_sub(ma), mt, st.saturating_sub(sf), st)
+}
+
+#[derive(Serialize)]
+struct ActReply {
+    ok: bool,
+    msg: String,
+}
+
+/// Start the control socket in a background thread. Failures here are non-fatal:
+/// the protection loop runs regardless of whether a HUD can attach.
+pub fn spawn_server() {
+    thread::spawn(|| {
+        if let Err(e) = serve() {
+            eprintln!("ipc: control socket unavailable: {}", e);
+        }
+    });
+}
+
+fn serve() -> std::io::Result<()> {
+    let _ = std::fs::remove_file(SOCKET_PATH);
+    let listener = UnixListener::bind(SOCKET_PATH)?;
+
+    // Let the graphical user (by primary group) connect; keep everyone else out.
+    std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o660))?;
+    if let Some(uid) = notify::graphical_uid() {
+        if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
+            let _ = nix::unistd::chown(SOCKET_PATH, None, Some(user.gid));
+        }
+    }
+    eprintln!("ipc: control socket listening at {}", SOCKET_PATH);
+
+    for stream in listener.incoming().flatten() {
+        // One thread per connection: a slow/silent client can't wedge the socket
+        // for everyone, and a panic in one handler can't take the server down.
+        thread::spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = handle(stream);
+            }));
+        });
+    }
+    Ok(())
+}
+
+fn handle(stream: UnixStream) -> std::io::Result<()> {
+    // A client that connects and never sends a line must not block this thread
+    // forever (it no longer blocks *others*, but still shouldn't leak).
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    // Kernel-verified identity of the connecting process. Trust this, never a pid
+    // a client puts in its JSON (which it can set to anything).
+    let peer_pid = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
+        .ok()
+        .map(|c| c.pid());
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+    let mut line = String::new();
+    // Bound the request: the read timeout resets on every byte, so a client that
+    // drips bytes with no newline would otherwise grow `line` unboundedly and OOM
+    // this (root) daemon — ironic for an OOM-prevention tool. 64 KiB is far more
+    // than any real command.
+    if (&mut reader).take(64 * 1024).read_line(&mut line)? == 0 {
+        return Ok(());
+    }
+    let reply = match serde_json::from_str::<Request>(line.trim()) {
+        Ok(Request::List) => serde_json::to_string(&build_list()),
+        Ok(Request::Act { action, id }) => serde_json::to_string(&do_act(&action, &id)),
+        // Ignore the client-supplied pid entirely — pin only the caller itself,
+        // identified by the kernel.
+        Ok(Request::PinSelf { .. }) => serde_json::to_string(&do_pin_self(peer_pid)),
+        Ok(Request::Foreground { pid }) => serde_json::to_string(&do_foreground(pid)),
+        Err(e) => serde_json::to_string(&ActReply {
+            ok: false,
+            msg: format!("bad request: {}", e),
+        }),
+    }
+    .unwrap_or_else(|_| "{\"ok\":false,\"msg\":\"serialize error\"}".into());
+    writeln!(writer, "{}", reply)
+}
+
+fn build_list() -> ListReply {
+    let (some_avg10, full_avg10) = match psi::read_psi("/proc/pressure/memory") {
+        Ok(r) => (r.some.avg10, r.full.map(|f| f.avg10).unwrap_or(0.0)),
+        Err(_) => (0.0, 0.0),
+    };
+    let raw_apps = cgroup::list_apps(LIST_MIN_BYTES);
+
+    // Flag the largest consumer rtux would *actually* pause first — same floor
+    // the mitigator uses, so the top-consumer marker never promises a pause that won't come.
+    let top = raw_apps
+        .iter()
+        .find(|a| {
+            a.has_freeze
+                && a.mem >= mitigate::MIN_FREEZE_BYTES
+                && !mitigate::never_freeze(&a.name, &a.raw)
+        })
+        .map(|a| a.path.clone());
+
+    let apps = raw_apps
+        .into_iter()
+        .map(|a| {
+            let freezable = a.has_freeze && !mitigate::never_freeze(&a.name, &a.raw);
+            let id = a
+                .path
+                .strip_prefix(CGROUP_BASE)
+                .unwrap_or(&a.path)
+                .to_string_lossy()
+                .to_string();
+            let flagged = if Some(&a.path) == top.as_ref() {
+                Some("top_consumer".to_string())
+            } else {
+                None
+            };
+            // Generic terminal scopes → name by their biggest process + cwd.
+            let name = if a.raw.starts_with("vte-spawn") {
+                cgroup::proc_label(&a.path).unwrap_or(a.name)
+            } else {
+                a.name
+            };
+            App {
+                id,
+                name,
+                mem_bytes: a.mem,
+                swap_bytes: a.swap,
+                frozen: a.frozen,
+                protected: a.mem_min > 0,
+                freezable,
+                flagged,
+            }
+        })
+        .collect();
+
+    let (mem_used, mem_total, swap_used, swap_total) = mem_swap();
+    let recent = crate::events::recent()
+        .into_iter()
+        .map(|(ago_secs, text)| RecentEvent { ago_secs, text })
+        .collect();
+    ListReply {
+        ok: true,
+        some_avg10,
+        full_avg10,
+        mem_used,
+        mem_total,
+        swap_used,
+        swap_total,
+        apps,
+        recent,
+        pressure_trend: crate::trend::history(),
+    }
+}
+
+/// Pin the HUD process resident + OOM-protected. `pid` is the *kernel-reported*
+/// connecting process (from SO_PEERCRED), not a client-supplied value — so a
+/// client can only ever pin itself, never an arbitrary pid. The comm check stays
+/// as defence-in-depth (a member could name their own process "pressured-hud",
+/// but then they only pin that one process — a bounded self-only effect).
+fn do_pin_self(pid: Option<i32>) -> ActReply {
+    let Some(pid) = pid else {
+        return ActReply {
+            ok: false,
+            msg: "refused: could not verify the calling process".into(),
+        };
+    };
+    let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if comm != "pressured-hud" {
+        return ActReply {
+            ok: false,
+            msg: "refused: caller is not the HUD".into(),
+        };
+    }
+    // Keep it out of the OOM killer's sights.
+    let _ = std::fs::write(format!("/proc/{}/oom_score_adj", pid), "-600");
+    // Keep its pages resident so it paints instantly when summoned under load.
+    if let Some(cg) = cgroup::cgroup_of_pid(pid) {
+        let _ = guard::protect_cgroup(&cg);
+    }
+    ActReply {
+        ok: true,
+        msg: "HUD pinned into the reserved control plane".into(),
+    }
+}
+
+// The app currently favoured as foreground (its memory.min is raised).
+static FOREGROUND: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Pin the focused app resident and relax the previous one. Session-critical
+/// cgroups (compositor/audio/etc.) are left untouched — guard already protects
+/// them, and we must never clear that.
+fn do_foreground(pid: i32) -> ActReply {
+    let Some(cg) = cgroup::cgroup_of_pid(pid) else {
+        return ActReply { ok: false, msg: format!("no cgroup for pid {}", pid) };
+    };
+    let raw = cg
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let name = cgroup::cgroup_to_app_name(&raw);
+    if mitigate::never_freeze(&name, &raw) {
+        return ActReply { ok: true, msg: format!("{} is a protected service — left as-is", name) };
+    }
+
+    // Recover from a poisoned lock rather than panicking the handler thread.
+    let mut fg = FOREGROUND.lock().unwrap_or_else(|e| e.into_inner());
+    if fg.as_deref() == Some(cg.as_path()) {
+        return ActReply { ok: true, msg: "unchanged".into() };
+    }
+    if let Some(prev) = fg.as_ref() {
+        let _ = guard::unprotect_cgroup(prev);
+    }
+    let _ = guard::protect_foreground(&cg);
+    *fg = Some(cg);
+    ActReply { ok: true, msg: format!("foreground → {}", name) }
+}
+
+/// Is this resolved cgroup a permitted target for a mutating action? The socket
+/// is reachable by any process running as the desktop user, so a client-supplied
+/// id is untrusted. `resolve_id` already confines it to the cgroup tree, but that
+/// still admits *slices*, the root, and `init.scope` — freezing/killing any of
+/// which takes down the session (or the whole system). So require a concrete unit
+/// and run the denylist against EVERY path component (not just the leaf, which is
+/// how an ancestor slice like `user.slice` slipped past), plus a self/ancestor/
+/// descendant guard so we can never target the daemon itself.
+fn permitted_target(path: &std::path::Path, action: &str) -> bool {
+    let leaf = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // Concrete unit only — never a slice or the cgroup root.
+    if !(leaf.ends_with(".scope") || leaf.ends_with(".service")) {
+        return false;
+    }
+    // The *target* must never be a systemd manager (`user@N.service` / the root
+    // `init.scope`): those hold the whole session / PID 1, and freezing one is an
+    // unrecoverable lockup. Note we check the LEAF here — `user@N.service` is a
+    // legitimate *ancestor* of every user app, so it must not be denied wholesale.
+    if leaf.starts_with("user@") {
+        return false;
+    }
+    // Session-critical check against every component, so an ancestor unit
+    // (init.scope) or a critical parent can't be reached through a child id.
+    for comp in path.components() {
+        let c = comp.as_os_str().to_string_lossy();
+        if mitigate::never_freeze(&c, &c) {
+            return false;
+        }
+    }
+    // Never the daemon itself, an ancestor of it, or a descendant of it.
+    if let Some(self_cg) = cgroup::self_cgroup() {
+        if self_cg.starts_with(path) || path.starts_with(&self_cg) {
+            return false;
+        }
+    }
+    // Irreversible kill is confined to the user's OWN apps (under app.slice).
+    // Reversible actions (freeze/cap/protect) may touch a system service like
+    // ollama, but an unprivileged client must never be able to *kill* a root
+    // service (data loss / privilege escalation) through this root daemon.
+    if action == "kill"
+        && !path
+            .components()
+            .any(|c| c.as_os_str() == "app.slice")
+    {
+        return false;
+    }
+    true
+}
+
+fn do_act(action: &str, id: &str) -> ActReply {
+    let Some(path) = cgroup::resolve_id(id) else {
+        return ActReply {
+            ok: false,
+            msg: format!("unknown or invalid id: {}", id),
+        };
+    };
+    let raw = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let name = cgroup::cgroup_to_app_name(&raw);
+
+    // Every action that freezes, limits, kills, or pins a target's memory is
+    // gated on the full-path safety check. (thaw/uncap only *undo* limits, so
+    // they stay permissive — worst case they lift a restriction.)
+    if matches!(
+        action,
+        "freeze" | "cap" | "kill" | "protect" | "unprotect"
+    ) && !permitted_target(&path, action)
+    {
+        return ActReply {
+            ok: false,
+            msg: format!("{} refused: {} is not a permitted target", action, name),
+        };
+    }
+
+    let res: anyhow::Result<String> = match action {
+        "freeze" => actions::freeze_cgroup(&path).map(|_| format!("Paused {}", name)),
+        "thaw" => actions::thaw_cgroup(&path).map(|_| format!("Resumed {}", name)),
+        "cap" => {
+            let cur = cgroup::read_cgroup_u64(&path, "memory.current").unwrap_or(0);
+            let cap = (cur / 2).max(128 * 1024 * 1024); // half current, floor 128 MB
+            actions::cap_cgroup(&path, cap).map(|_| format!("Capped {}", name))
+        }
+        "uncap" => actions::uncap_cgroup(&path).map(|_| format!("Uncapped {}", name)),
+        "kill" => actions::kill_cgroup(&path).map(|_| format!("Closed {}", name)),
+        "protect" => guard::protect_cgroup(&path).map(|_| format!("Protected {}", name)),
+        "unprotect" => guard::unprotect_cgroup(&path).map(|_| format!("Unprotected {}", name)),
+        other => {
+            return ActReply {
+                ok: false,
+                msg: format!("unknown action: {}", other),
+            }
+        }
+    };
+    match res {
+        Ok(msg) => {
+            crate::events::record(msg.clone());
+            ActReply { ok: true, msg }
+        }
+        Err(e) => ActReply {
+            ok: false,
+            msg: format!("{} failed: {}", action, e),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::permitted_target;
+    use std::path::Path;
+
+    const CHROME: &str =
+        "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-com.google.Chrome-1234.scope";
+    const USER_MGR: &str =
+        "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service";
+    const OLLAMA: &str = "/sys/fs/cgroup/system.slice/ollama.service";
+
+    // Slices, the root, and init.scope must be refused for any action.
+    #[test]
+    fn slices_root_and_init_are_refused() {
+        for a in ["freeze", "kill", "protect"] {
+            assert!(!permitted_target(Path::new("/sys/fs/cgroup"), a));
+            assert!(!permitted_target(Path::new("/sys/fs/cgroup/user.slice"), a));
+            assert!(!permitted_target(Path::new("/sys/fs/cgroup/system.slice"), a));
+            assert!(!permitted_target(Path::new("/sys/fs/cgroup/init.scope"), a));
+        }
+    }
+
+    // The systemd --user manager (freezing it = unrecoverable session lockup)
+    // must be refused as a TARGET, even though it's a legit app ancestor.
+    #[test]
+    fn user_manager_is_refused() {
+        for a in ["freeze", "kill", "cap"] {
+            assert!(!permitted_target(Path::new(USER_MGR), a));
+        }
+    }
+
+    // Session-critical units stay refused even reached through a full path.
+    #[test]
+    fn critical_units_are_refused_by_component() {
+        assert!(!permitted_target(Path::new(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/session.slice/org.gnome.Shell@wayland.service"
+        ), "freeze"));
+        assert!(!permitted_target(Path::new("/sys/fs/cgroup/system.slice/pipewire.service"), "freeze"));
+    }
+
+    // A user's own app is fully actionable.
+    #[test]
+    fn ordinary_app_unit_is_permitted() {
+        for a in ["freeze", "kill", "cap", "protect"] {
+            assert!(permitted_target(Path::new(CHROME), a));
+        }
+    }
+
+    // A system service (e.g. ollama) may be *paused* (reversible) but never
+    // *killed* by an unprivileged client through the root daemon.
+    #[test]
+    fn system_service_freezable_not_killable() {
+        assert!(permitted_target(Path::new(OLLAMA), "freeze"));
+        assert!(permitted_target(Path::new(OLLAMA), "cap"));
+        assert!(!permitted_target(Path::new(OLLAMA), "kill"));
+    }
+}

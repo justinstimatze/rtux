@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=rtux
+Comment=Desktop responsiveness control window
+Exec=pressured-hud
+Icon=dialog-warning
+Terminal=false
+Categories=System;Monitor;
+StartupNotify=true
+NoDisplay=true
