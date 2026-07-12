@@ -15,5 +15,35 @@ AmbientCapabilities=CAP_IPC_LOCK CAP_SYS_RESOURCE
 # Keep our own footprint bounded — the daemon stays tiny.
 MemoryMax=64M
 
+# --- Sandboxing ---
+# This is a root daemon, so it's hardened as far as its job allows. It is NOT
+# heavily confinable: it must write cgroup v2 controls all over /sys/fs/cgroup,
+# read every process's /proc, write other processes' oom_score_adj, and drop to
+# the graphical user (runuser) to send notifications. So the directives that would
+# break those — ProtectControlGroups=yes, ProtectKernelTunables=yes,
+# ProtectProc=/ProcSubset=, ProtectHome=, PrivateTmp= — are deliberately left off.
+# Everything below is safe with the above and still meaningfully shrinks the
+# blast radius.
+CapabilityBoundingSet=CAP_IPC_LOCK CAP_SYS_RESOURCE CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectControlGroups=false
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# Filtered syscalls return EPERM rather than killing the daemon — a filter miss
+# degrades gracefully (e.g. a logged mlockall warning) instead of taking the
+# protector down.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
 [Install]
 WantedBy=multi-user.target

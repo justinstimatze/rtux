@@ -5,6 +5,15 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Changed
+- Harden the systemd unit: `NoNewPrivileges`, a minimal `CapabilityBoundingSet`
+  (only IPC_LOCK, SYS_RESOURCE, SETUID/SETGID, CHOWN, DAC_OVERRIDE/READ_SEARCH),
+  `ProtectSystem=full`, `MemoryDenyWriteExecute`, `RestrictAddressFamilies`,
+  `SystemCallFilter=@system-service` (EPERM, not kill), and the usual
+  Protect*/Restrict* directives. The confinement that would break the daemon's
+  job (cgroupfs writes, `/proc` scanning, dropping to the user for notifications)
+  is deliberately left off and documented in the unit.
+
 ## [0.1.0] — first tagged release
 
 The initial public cut: a working, validated desktop-responsiveness daemon.
