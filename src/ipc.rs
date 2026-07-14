@@ -189,8 +189,10 @@ fn build_list() -> ListReply {
             } else {
                 None
             };
-            // Generic terminal scopes → name by their biggest process + cwd.
-            let name = if a.raw.starts_with("vte-spawn") {
+            // Terminal child scopes (vte-spawn / tmux-spawn) → name by their
+            // session (a Claude session becomes "claude · dir") or biggest
+            // process + cwd, instead of a mangled UUID scope name.
+            let name = if a.raw.starts_with("vte-spawn") || a.raw.starts_with("tmux-spawn") {
                 cgroup::proc_label(&a.path).unwrap_or(a.name)
             } else {
                 a.name

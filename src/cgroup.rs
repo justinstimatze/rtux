@@ -206,6 +206,11 @@ fn rss_bytes(pid: i32) -> u64 {
 /// running in. Turns a wall of identical "Terminal (child)" rows into e.g.
 /// "claude · rtux" / "node · publicai" so they can be told apart.
 pub fn proc_label(cgroup_path: &Path) -> Option<String> {
+    // A Claude session is the common case in terminal scopes and has a canonical
+    // directory-qualified label — share it so the HUD and the kill witness agree.
+    if let Some(label) = claude_session_label(cgroup_path) {
+        return Some(label);
+    }
     let procs = fs::read_to_string(cgroup_path.join("cgroup.procs")).ok()?;
     let mut best_pid = 0i32;
     let mut best_rss = 0u64;
@@ -302,8 +307,11 @@ pub fn claude_session_label(cgroup_path: &Path) -> Option<String> {
             let dir = fs::read_link(format!("/proc/{}/cwd", pid))
                 .ok()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                .unwrap_or_else(|| "?".to_string());
-            return Some(format!("claude ({})", dir));
+                .filter(|d| !d.is_empty() && d != "/");
+            return Some(match dir {
+                Some(d) => format!("claude · {}", d),
+                None => "claude".to_string(),
+            });
         }
     }
     None
@@ -408,8 +416,13 @@ pub fn cgroup_to_app_name(scope: &str) -> String {
     let raw = scope.trim_end_matches(".scope").trim_end_matches(".service").trim_end_matches(".slice");
     let s = unescape_systemd(raw);
 
-    // VTE terminal child processes: vte-spawn-<UUID> -> "Terminal (child)"
-    if s.starts_with("vte-spawn-") || s.starts_with("Vte-spawn-") {
+    // Terminal child scopes: vte-spawn-<UUID> / tmux-spawn-<UUID> -> generic
+    // fallback. (Callers that want the richer "claude · dir" label run proc_label
+    // for these; this is only the bare-name fallback.)
+    if s.starts_with("vte-spawn-")
+        || s.starts_with("Vte-spawn-")
+        || s.starts_with("tmux-spawn-")
+    {
         return "Terminal (child)".to_string();
     }
 
