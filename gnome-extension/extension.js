@@ -51,14 +51,20 @@ const Indicator = GObject.registerClass(
 class RtuxIndicator extends PanelMenu.Button {
     _init() {
         super._init(0.0, 'rtux', true); // dontCreateMenu — clicks launch the HUD
+        this._liveLevel = 'normal';
+        // Latched-witness state: set the first time pressure goes critical, held
+        // until the user opens the HUD. See setLevel().
+        this._latched = false;
         this._dot = new St.Label({
-            text: '●', // ●
+            text: '●',
             y_align: Clutter.ActorAlign.CENTER,
             style_class: 'rtux-dot rtux-good',
         });
         this.add_child(this._dot);
 
         this.connect('button-press-event', () => {
+            // Opening the HUD is the acknowledgement — clear the witness mark.
+            this.clearLatch();
             try {
                 GLib.spawn_command_line_async(`sh -c ${GLib.shell_quote(SUMMON_HUD)}`);
             } catch (e) {
@@ -69,12 +75,40 @@ class RtuxIndicator extends PanelMenu.Button {
     }
 
     setLevel(level) {
+        this._liveLevel = level;
+        // Latch a witness the first time pressure goes critical. Even after PSI
+        // falls back — and especially under Do-Not-Disturb, when no banner and no
+        // drawer entry fire — the dot must keep a visible record that the machine
+        // intervened, until the user acknowledges it by opening the HUD. Without
+        // this the dot snaps back to calm green the instant pressure clears, so a
+        // *completed* freeze leaves no trace at all (gh #1).
+        if (level === 'critical')
+            this._latched = true;
+        this._render();
+    }
+
+    clearLatch() {
+        if (!this._latched)
+            return;
+        this._latched = false;
+        this._render();
+    }
+
+    _render() {
         for (const c of ['rtux-good', 'rtux-warn', 'rtux-crit'])
             this._dot.remove_style_class_name(c);
         this._dot.add_style_class_name(
-            level === 'critical' ? 'rtux-crit'
-            : level === 'elevated' ? 'rtux-warn'
+            this._liveLevel === 'critical' ? 'rtux-crit'
+            : this._liveLevel === 'elevated' ? 'rtux-warn'
             : 'rtux-good');
+        // A latched witness shows a ringed dot (◉): the colour still tracks
+        // current pressure (green again once it's calm), but the ring says "I did
+        // something while you weren't looking — click to see." Plain ● otherwise.
+        this._dot.set_text(this._latched ? '◉' : '●');
+        if (this._latched)
+            this._dot.add_style_class_name('rtux-latched');
+        else
+            this._dot.remove_style_class_name('rtux-latched');
     }
 });
 

@@ -80,10 +80,13 @@ pub fn notify_action(
         urgency.into(),
         "--expire-time".into(),
         "12000".into(),
-        // Transient like every other rtux notice — fades from the drawer on its
-        // own, never lingers demanding acknowledgement.
-        "--hint".into(),
-        "int:transient:1".into(),
+        // NOT transient — unlike the gentler notify_session notices. This is the
+        // freeze notice, the one intervention that must leave a witnessable
+        // record: under Do-Not-Disturb a transient notice shows no banner AND no
+        // drawer entry, so the user gets zero trace of what the machine did (gh
+        // #1). Non-transient persists in the notification drawer even when the
+        // banner is suppressed. Still normal (not critical/resident) urgency — the
+        // banner auto-expires and it never demands manual dismissal.
         "--app-name".into(),
         "pressured".into(),
         "--icon".into(),
