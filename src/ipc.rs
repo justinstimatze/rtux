@@ -290,7 +290,11 @@ fn do_foreground(pid: i32) -> ActReply {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let name = cgroup::cgroup_to_app_name(&raw);
-    if mitigate::never_freeze(&name, &raw) {
+    // Only skip the hard-exempt spine (compositor/audio/dbus/system) — guard
+    // already protects those and we must not disturb them. A focused *terminal*
+    // is NOT hard-exempt: it's a legitimate foreground to favour (memory pin +
+    // cpu.weight boost), which matters since the user is often typing in one.
+    if mitigate::hard_exempt(&name, &raw) {
         return ActReply { ok: true, msg: format!("{} is a protected service — left as-is", name) };
     }
 

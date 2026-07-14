@@ -22,6 +22,10 @@ use std::time::Duration;
 /// going critical again within 6s). This gate holds recovery until the calm is
 /// real.
 const RECOVER_AFTER_NORMAL_SECS: u32 = 10;
+/// CPU-PSI `some.avg10` above this means the cores are contended enough that the
+/// desktop/foreground would visibly lag — trip the active CPU throttle. (During
+/// the 2026-07-14 load-27-on-8-cores lag it sat ~26.)
+const CPU_PRESSURE_THRESHOLD: f64 = 15.0;
 
 #[derive(Parser)]
 #[command(
@@ -150,6 +154,7 @@ fn run_daemon() -> Result<()> {
     let poll_interval = Duration::from_secs(1);
     let mut ticks: u64 = 0;
     let mut normal_streak: u32 = 0;
+    let mut cpu_normal_streak: u32 = 0;
 
     loop {
         ticks += 1;
@@ -202,6 +207,24 @@ fn run_daemon() -> Result<()> {
                 normal_streak = normal_streak.saturating_add(1);
                 if normal_streak >= RECOVER_AFTER_NORMAL_SECS {
                     mitigator.recover();
+                }
+            }
+        }
+
+        // CPU pressure is independent of memory pressure — a machine can have
+        // idle RAM but saturated cores (many parallel builds/agents), which is
+        // exactly what makes typing lag. Scrappy active throttle: demote
+        // background hogs' cpu.weight while the cores are contended so the desktop
+        // and focused app stay instant, and restore once it clears. The user's
+        // priority is a responsive interface; background apps may slow.
+        if let Ok(cpu_psi) = psi::read_psi("/proc/pressure/cpu") {
+            if cpu_psi.some.avg10 > CPU_PRESSURE_THRESHOLD {
+                cpu_normal_streak = 0;
+                mitigator.cpu_throttle();
+            } else {
+                cpu_normal_streak = cpu_normal_streak.saturating_add(1);
+                if cpu_normal_streak >= RECOVER_AFTER_NORMAL_SECS {
+                    mitigator.cpu_recover();
                 }
             }
         }

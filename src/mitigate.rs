@@ -45,8 +45,11 @@ fn matches_any(name: &str, raw_dir_name: &str, list: &[&str]) -> bool {
     list.iter().any(|d| raw_dir_name.contains(d) || name.contains(d))
 }
 
-/// Hard-exempt from *automatic* mitigation (freeze or kill).
-fn hard_exempt(name: &str, raw_dir_name: &str) -> bool {
+/// Hard-exempt from *automatic* mitigation (freeze or kill), and from the
+/// foreground protection path — the spine/system/daemon must never be pinned,
+/// boosted, or relaxed as if it were an ordinary focused app. Terminals are NOT
+/// hard-exempt: a focused terminal is a legitimate foreground to favour.
+pub fn hard_exempt(name: &str, raw_dir_name: &str) -> bool {
     matches_any(name, raw_dir_name, HARD_EXEMPT_NAMES)
 }
 
@@ -133,6 +136,15 @@ const SWAP_HIGH_WATER: f64 = 0.85;
 /// Warn (once) when at least this many Claude sessions are running — an early,
 /// gentle nudge to close some before pressure ever forces a freeze or kill.
 const CLAUDE_SESSION_WARN_COUNT: usize = 4;
+/// cpu.weight a background hog is demoted to under CPU contention (vs the 100
+/// default and the foreground's 1000). Low enough to cede the cores to the
+/// desktop + focused app; still non-zero so it isn't fully starved.
+const CPU_WEIGHT_THROTTLED: u32 = 10;
+/// The default cpu.weight a demoted hog is restored to when CPU pressure clears.
+const CPU_WEIGHT_NORMAL: u32 = 100;
+/// Skip demoting cgroups smaller than this (avoid churn on trivial ones). Most
+/// sustained CPU hogs — compiles, node, browsers — are well above it.
+const CPU_THROTTLE_FLOOR: u64 = 64 * 1024 * 1024; // 64 MB
 
 pub struct Mitigator {
     frozen: Vec<(PathBuf, String)>,
@@ -143,6 +155,9 @@ pub struct Mitigator {
     killed: Vec<PathBuf>,
     /// Debounce for the "too many Claude sessions" advisory.
     advised: bool,
+    /// Background hogs whose cpu.weight we've demoted under CPU pressure —
+    /// restored on cpu_recover(). Independent of the memory ladder.
+    cpu_throttled: Vec<PathBuf>,
     self_cgroup: Option<PathBuf>,
 }
 
@@ -153,8 +168,45 @@ impl Mitigator {
             throttled: Vec::new(),
             killed: Vec::new(),
             advised: false,
+            cpu_throttled: Vec::new(),
             self_cgroup: cgroup::self_cgroup(),
         }
+    }
+
+    /// CPU pressure: demote *background* hogs' cpu.weight so the desktop and the
+    /// focused app keep the cores. cpu.weight is work-conserving, so this is a
+    /// no-op for idle background cgroups and only bites the ones actually burning
+    /// CPU — which is why we can blanket-demote without sampling who's hot. The
+    /// foreground and the hard-exempt spine are spared by denied(). Reversible.
+    pub fn cpu_throttle(&mut self) {
+        let candidates = match cgroup::list_freezable_cgroups() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for (path, name, mem) in candidates {
+            if mem < CPU_THROTTLE_FLOOR {
+                break; // sorted largest-first
+            }
+            if self.denied(&name, &path) || self.cpu_throttled.iter().any(|p| p == &path) {
+                continue;
+            }
+            cgroup::ensure_cpu_controller(&path);
+            if actions::set_cpu_weight(&path, CPU_WEIGHT_THROTTLED).is_ok() {
+                self.cpu_throttled.push(path);
+            }
+        }
+    }
+
+    /// CPU pressure cleared: restore every background hog we demoted.
+    pub fn cpu_recover(&mut self) {
+        if self.cpu_throttled.is_empty() {
+            return;
+        }
+        let count = self.cpu_throttled.len();
+        for path in std::mem::take(&mut self.cpu_throttled) {
+            let _ = actions::set_cpu_weight(&path, CPU_WEIGHT_NORMAL);
+        }
+        eprintln!("restored cpu.weight on {} background app(s)", count);
     }
 
     /// Elevated pressure: gently throttle the largest freezable consumer via

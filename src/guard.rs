@@ -204,6 +204,13 @@ fn set_desktop_cpu_priority(compositor_path: &Path) {
     if let Err(e) = crate::actions::set_cpu_weight(session_slice, CPU_WEIGHT_DESKTOP) {
         eprintln!("  note: could not set desktop cpu.weight ({e})");
     }
+    // Also enable the cpu controller on the sibling app.slice now, so foreground
+    // leaf boosts and background throttling can set cpu.weight there without
+    // waiting for the first focus event. (app.slice is not on the compositor's
+    // ancestor chain, so the call above doesn't reach it.)
+    if let Some(user_service) = session_slice.parent() {
+        cgroup::ensure_cpu_controller(&user_service.join("app.slice").join("_"));
+    }
 }
 
 pub struct ProtectedService {
