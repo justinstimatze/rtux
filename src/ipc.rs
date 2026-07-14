@@ -262,11 +262,24 @@ fn do_pin_self(pid: Option<i32>) -> ActReply {
 
 // The app currently favoured as foreground (its memory.min is raised).
 static FOREGROUND: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+// The focused *window's* pid (the terminal emulator, for a terminal). The
+// auto-mitigator uses it to spare the active terminal and all its tabs from
+// freeze/kill — their processes descend from this pid (see pid_descends_from).
+static FOREGROUND_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The focused window's pid, or None if nothing has reported focus yet.
+pub fn foreground_pid() -> Option<i32> {
+    let p = FOREGROUND_PID.load(std::sync::atomic::Ordering::Relaxed);
+    (p > 0).then_some(p)
+}
 
 /// Pin the focused app resident and relax the previous one. Session-critical
 /// cgroups (compositor/audio/etc.) are left untouched — guard already protects
 /// them, and we must never clear that.
 fn do_foreground(pid: i32) -> ActReply {
+    // Remember the focused window's pid so the mitigator can spare the terminal
+    // the user is in (and its tabs) — independent of the memory.min pinning below.
+    FOREGROUND_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
     let Some(cg) = cgroup::cgroup_of_pid(pid) else {
         return ActReply { ok: false, msg: format!("no cgroup for pid {}", pid) };
     };

@@ -175,16 +175,23 @@ fn run_daemon() -> Result<()> {
         match level {
             psi::PressureLevel::Critical => {
                 normal_streak = 0;
-                // Closed loop: pause the biggest freezable hog, then notify.
+                // Closed loop: pause the biggest freezable hog, then — if freezing
+                // is spent or swap is nearly full — SIGKILL the worst background
+                // hog rather than let the climb reach the kernel's blind global
+                // OOM killer (which took down the whole session on 2026-07-14).
+                // kill_worst self-gates, so calling it every critical tick is safe.
                 mitigator.escalate();
+                mitigator.kill_worst();
                 let apps = ranker::rank_apps().unwrap_or_default();
                 notifier.maybe_notify(level, &apps);
             }
             psi::PressureLevel::Elevated => {
                 normal_streak = 0;
                 // Gently throttle the biggest hog first (reversible, low-stall),
-                // and warn. Freezes are held back until Critical.
+                // nudge the user if a lot of Claude sessions have piled up, and
+                // warn. Freezes/kills are held back until Critical.
                 mitigator.throttle();
+                mitigator.advise_claude_sessions();
                 let apps = ranker::rank_apps().unwrap_or_default();
                 notifier.maybe_notify(level, &apps);
             }

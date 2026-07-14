@@ -29,6 +29,20 @@ tag is the source of truth (the binary reports it via `pressured --version`).
   pre-v0.2.0 binary.
 
 ### Added
+- **A kill rung — rtux now stops the climb to global OOM instead of watching
+  it.** Its ladder topped out at "freeze," and it blanket-exempted every
+  terminal (`vte-spawn`), so on a machine whose pressure comes from background
+  terminal/Claude sessions it froze what little it could (a browser) and then
+  sat helpless while memory climbed to the kernel's global OOM killer. Now:
+  background terminal sessions are actionable (the **foreground** terminal and
+  all its tabs are still spared, via focus tracking + process-descendant
+  checks); and when freezing is spent or swap is ≥85% full, rtux SIGKILLs the
+  worst background hog. Victim ranking is **B→C→A**: a non-Claude hog (a browser)
+  dies before any Claude session, and a Claude kill is announced at critical
+  urgency **with its directory** (e.g. "claude (rtux)") so the session can be
+  resumed. Capped per episode; the hard-exempt spine is never touched. Also adds
+  an early advisory when ≳4 Claude sessions pile up — a gentle nudge to close
+  some before pressure forces anything.
 - **The session bus and the kernel OOM killer are now handled** — hardening after
   a full session crash on 2026-07-14, where RAM *and* swap were exhausted, the
   kernel's *global* OOM killer fired (bypassing both rtux and systemd-oomd), and

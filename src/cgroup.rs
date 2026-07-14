@@ -258,6 +258,78 @@ pub fn cgroup_of_pid(pid: i32) -> Option<PathBuf> {
     None
 }
 
+/// The parent pid of `pid`, from /proc/<pid>/stat. The comm field (2nd) can
+/// contain spaces and parens, so we index from the *last* ')': after it come
+/// state (field 3) then ppid (field 4).
+fn ppid_of(pid: i32) -> Option<i32> {
+    let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    let after = &stat[stat.rfind(')')? + 1..];
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// True if `pid` is `ancestor` or descends from it via the parent chain. Used to
+/// spare the *foreground* terminal and all its tabs: the focus tracker reports
+/// the terminal window's pid, and its shell/agent children live in sibling
+/// vte-spawn scopes whose processes descend from it. Bounded walk (cycles/depth).
+pub fn pid_descends_from(mut pid: i32, ancestor: i32) -> bool {
+    if ancestor <= 0 {
+        return false;
+    }
+    for _ in 0..64 {
+        if pid == ancestor {
+            return true;
+        }
+        if pid <= 1 {
+            return false;
+        }
+        match ppid_of(pid) {
+            Some(p) => pid = p,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// If this cgroup hosts a Claude Code session, return a directory-qualified label
+/// (e.g. "claude (rtux)") so a kill notification says *which* session died and
+/// the user can resume it. None if it isn't a Claude session.
+pub fn claude_session_label(cgroup_path: &Path) -> Option<String> {
+    let procs = fs::read_to_string(cgroup_path.join("cgroup.procs")).ok()?;
+    for line in procs.lines() {
+        let Ok(pid) = line.trim().parse::<i32>() else { continue };
+        let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
+        if comm.trim() == "claude" {
+            let dir = fs::read_link(format!("/proc/{}/cwd", pid))
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| "?".to_string());
+            return Some(format!("claude ({})", dir));
+        }
+    }
+    None
+}
+
+/// Fraction of swap in use (0.0–1.0), from /proc/meminfo. When this nears 1.0
+/// there's nowhere left to reclaim to — freeze-to-zram is futile and the machine
+/// thrashes — so it's a hard trigger to escalate straight to the kill rung.
+pub fn swap_used_fraction() -> f64 {
+    let Ok(mi) = fs::read_to_string("/proc/meminfo") else { return 0.0 };
+    let kb = |rest: &str| -> u64 { rest.trim().trim_end_matches("kB").trim().parse().unwrap_or(0) };
+    let (mut total, mut free) = (0u64, 0u64);
+    for line in mi.lines() {
+        if let Some(r) = line.strip_prefix("SwapTotal:") {
+            total = kb(r);
+        } else if let Some(r) = line.strip_prefix("SwapFree:") {
+            free = kb(r);
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        total.saturating_sub(free) as f64 / total as f64
+    }
+}
+
 /// The cgroup directory of the current process — used to avoid freezing ourselves.
 pub fn self_cgroup() -> Option<PathBuf> {
     let content = fs::read_to_string("/proc/self/cgroup").ok()?;
