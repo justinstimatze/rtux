@@ -5,6 +5,33 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Fixed
+- **Daemon silently never started at boot.** The unit's `After=graphical.target`
+  combined with `WantedBy=multi-user.target` formed an ordering cycle (graphical
+  → multi-user → rtux → graphical); systemd broke it by deleting rtux's start
+  job, so pressured only ever ran when hand-started via `install.sh`. Removed the
+  `After=graphical.target` ordering. Surfaced when an OOM event tore down the
+  session while the daemon meant to be protecting the desktop wasn't running.
+
+### Removed
+- **Tray indicator** (`pressured-tray`) and its `ksni` dependency. It duplicated
+  the GNOME Shell extension's job — a PSI-coloured top-bar dot that opens the HUD
+  on click — so a standard install (installer + `install-extension.sh`) showed
+  *two* dots. The extension is strictly more capable (it also does
+  attention-following, which a StatusNotifierItem can't), so the tray is retired
+  in its favour. `uninstall.sh` still removes any previously installed tray
+  binary and autostart entry.
+
+### Added
+- **systemd-oomd reconciliation** (`50-pressured-oomd.conf`, installed to
+  `/etc/systemd/system/user@.service.d/`). Ubuntu's stock oomd policy SIGKILLs
+  the largest cgroup in the user slice at 50% PSI pressure — the same band
+  pressured works in — so the two race and oomd wins (it can SIGKILL the
+  compositor's cgroup, tearing down the session while pressured is
+  mid-mitigation). The drop-in raises oomd's threshold to
+  80%, ceding the 50–80% band to pressured while keeping oomd as a hard backstop.
+  Removed by `uninstall.sh`.
+
 ### Changed
 - Harden the systemd unit: `NoNewPrivileges`, a minimal `CapabilityBoundingSet`
   (only IPC_LOCK, SYS_RESOURCE, SETUID/SETGID, CHOWN, DAC_OVERRIDE/READ_SEARCH),

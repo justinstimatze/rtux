@@ -24,7 +24,7 @@ and most others).
 
 ```sh
 sudo apt install libgtk-4-dev libadwaita-1-dev   # for the control window (Ubuntu 24.04+)
-cargo build --release --features hud,tray
+cargo build --release --features hud
 sudo ./install.sh          # raises the guardian, offers to enable zram
 ./setup-hotkey.sh          # Ctrl+Alt+P summons the control window
 ./install-extension.sh     # the top-bar light (wakes at your next login)
@@ -141,8 +141,8 @@ status` gives a quick reading of the pressure.)*
 ## Returning it to the wild (uninstalling)
 
 rtux leaves no trace it can't undo. One script reverses the whole thing — the
-service and binaries, the tray autostart, the hotkey, the top-bar extension, and
-the zram config and tuning:
+service and binaries, the hotkey, the top-bar extension, and the zram config and
+tuning:
 
 ```sh
 sudo ./uninstall.sh

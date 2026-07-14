@@ -31,37 +31,18 @@ else
     echo "(pressured-hud not built — run: cargo build --release --features hud)"
 fi
 
-TRAY="$REPO/target/release/pressured-tray"
-if [[ -x "$TRAY" ]]; then
-    echo "Installing tray   → /usr/local/bin/pressured-tray"
-    install -m 0755 "$TRAY" /usr/local/bin/pressured-tray
-    # Autostart the indicator for the real (non-root) user on each login.
-    if [[ -n "${SUDO_USER:-}" ]]; then
-        UHOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-        AUTO="$UHOME/.config/autostart"
-        mkdir -p "$AUTO"
-        cat > "$AUTO/pressured-tray.desktop" <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=rtux pressure indicator
-Exec=/usr/local/bin/pressured-tray
-X-GNOME-Autostart-enabled=true
-NoDisplay=true
-EOF
-        # Use the user's real primary group (not always == username).
-        UGROUP=$(id -gn "$SUDO_USER" 2>/dev/null || echo "$SUDO_USER")
-        chown "$SUDO_USER:$UGROUP" "$AUTO/pressured-tray.desktop"
-        echo "  autostart added for $SUDO_USER (starts on each login)"
-    else
-        echo "  (no SUDO_USER — tray autostart skipped; run install.sh via 'sudo',"
-        echo "   or add ~/.config/autostart/pressured-tray.desktop yourself)"
-    fi
-else
-    echo "(pressured-tray not built — run: cargo build --release --features tray)"
-fi
-
 echo "Installing unit   → /etc/systemd/system/rtux.service"
 install -m 0644 "$REPO/rtux.service" /etc/systemd/system/rtux.service
+
+# Reconcile with systemd-oomd. Ubuntu's stock policy kills the largest cgroup in
+# the user slice at 50% PSI pressure — the same band pressured works in — so the
+# two race and oomd wins (it can SIGKILL the compositor's cgroup mid-mitigation,
+# tearing down the session). Raise oomd's threshold to 80% so pressured acts
+# first, keeping oomd as a hard backstop. Reversible: uninstall.sh removes it.
+# Harmless on systems without systemd-oomd.
+echo "Installing oomd drop-in → /etc/systemd/system/user@.service.d/50-pressured-oomd.conf"
+install -d -m 0755 /etc/systemd/system/user@.service.d
+install -m 0644 "$REPO/50-pressured-oomd.conf" /etc/systemd/system/user@.service.d/50-pressured-oomd.conf
 
 echo "Reloading systemd and (re)starting service..."
 systemctl daemon-reload

@@ -1,7 +1,13 @@
 [Unit]
 Description=pressured — PSI-driven desktop responsiveness daemon
 Documentation=https://github.com/justinstimatze/rtux
-After=graphical.target
+# NOTE: do NOT add `After=graphical.target` here. graphical.target is itself
+# ordered After=multi-user.target, and this unit installs into
+# multi-user.target (below) — the combination forms an ordering cycle that
+# systemd breaks by DELETING our start job, so the daemon silently never runs
+# at boot (it only came up when hand-started via install.sh). As a root cgroup
+# daemon we don't need the graphical session to exist first; notifications
+# already degrade gracefully until a user session is present.
 
 [Service]
 Type=simple

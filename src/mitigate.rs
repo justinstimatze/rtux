@@ -6,7 +6,7 @@ use crate::{actions, cgroup, notify};
 /// Summon the HUD to the foreground. Wayland only grants focus to a *fresh*
 /// client, so we SIGKILL any running HUD (instant death frees the D-Bus name
 /// before the relaunch can race it) and spawn a new process, which reliably
-/// jumps to the front. Mirrored in `setup-hotkey.sh` and `pressured-tray.rs`.
+/// jumps to the front. Mirrored in `setup-hotkey.sh` and the GNOME extension.
 pub const SUMMON_HUD: &str = "pkill -KILL -x pressured-hud; for i in $(seq 50); do pgrep -x pressured-hud >/dev/null || break; sleep 0.02; done; pressured-hud";
 
 /// Cgroups we must never freeze: freezing any of these would make the desktop
