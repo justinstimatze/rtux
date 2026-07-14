@@ -202,5 +202,5 @@ memory pressure — froze a 1.1 GB browser to hold the desktop responsive and sa
 so legibly, unprompted. The user's reaction ("oh nice") is the thesis confirmed:
 a resource crunch felt like the machine's competence, not its failure. The
 component pieces (freeze/thaw, protection, OOM immunity, throttle, socket, HUD,
-pin, tray) were individually verified earlier; the PSI-Critical→freeze trip is
+pin) were individually verified earlier; the PSI-Critical→freeze trip is
 now proven in production.

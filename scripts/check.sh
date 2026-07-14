@@ -23,7 +23,7 @@ fi
 
 step "clippy"
 if cargo clippy --version >/dev/null 2>&1; then
-    cargo clippy --all-targets --features hud,tray || fail=1
+    cargo clippy --all-targets --features hud || fail=1
 else
     echo "  clippy not installed — skipping (rustup component add clippy)"
 fi
@@ -31,11 +31,11 @@ fi
 step "build — daemon only (no GUI deps)"
 cargo build || fail=1
 
-step "build — hud + tray"
-cargo build --features hud,tray || fail=1
+step "build — hud"
+cargo build --features hud || fail=1
 
 step "test"
-cargo test --features hud,tray || fail=1
+cargo test --features hud || fail=1
 
 echo
 if [[ $fail -ne 0 ]]; then

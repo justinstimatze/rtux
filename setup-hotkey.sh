@@ -19,7 +19,7 @@ fi
 if ! command -v pressured-hud >/dev/null; then
     echo "warning: 'pressured-hud' isn't on PATH — the hotkey would launch nothing."
     echo "         Build + install it first:"
-    echo "           cargo build --release --features hud,tray && sudo ./install.sh"
+    echo "           cargo build --release --features hud && sudo ./install.sh"
     echo "         Binding anyway; it'll work once the HUD is installed."
 fi
 

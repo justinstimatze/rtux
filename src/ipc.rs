@@ -23,7 +23,7 @@ enum Request {
     PinSelf { pid: i32 },
     /// A focus tracker reports the newly-focused window's pid. The daemon pins
     /// that app resident (clamped) and relaxes the previous foreground — so the
-    /// window you're in is always instant. Client-agnostic (shell ext, tray,
+    /// window you're in is always instant. Client-agnostic (shell ext,
     /// AT-SPI, …).
     Foreground { pid: i32 },
 }

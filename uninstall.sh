@@ -31,6 +31,8 @@ strip_from_list() {
 echo "== stopping + removing the service =="
 systemctl disable --now rtux.service 2>/dev/null
 rm -f /etc/systemd/system/rtux.service
+rm -f /etc/systemd/system/user@.service.d/50-pressured-oomd.conf
+rmdir --ignore-fail-on-non-empty /etc/systemd/system/user@.service.d 2>/dev/null || true
 systemctl daemon-reload
 systemctl reset-failed rtux.service 2>/dev/null || true
 
