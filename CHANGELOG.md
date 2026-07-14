@@ -5,6 +5,14 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+## [0.2.1] — surviving the global OOM
+
+A full session crash on 2026-07-14 (RAM and swap both exhausted → the kernel's
+own global OOM killer fired and took down dbus, collapsing the desktop) drove
+this release: rtux now escalates all the way to killing background hogs before
+the kernel can, protects the session bus, and biases the kernel OOM killer away
+from the session spine. Plus the fixes that were sitting unreleased.
+
 ### Fixed
 - **Every protection falsely reported failure (page-alignment).** The kernel
   stores `memory.min` rounded *down* to a page (4 KB) multiple, so an unaligned
@@ -149,6 +157,7 @@ The initial public cut: a working, validated desktop-responsiveness daemon.
 - Installer, uninstaller, hotkey and extension setup scripts; a contained latency
   benchmark under `benchmarks/`.
 
-[Unreleased]: https://github.com/justinstimatze/rtux/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/justinstimatze/rtux/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/justinstimatze/rtux/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/justinstimatze/rtux/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/justinstimatze/rtux/releases/tag/v0.1.0
