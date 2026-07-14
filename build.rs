@@ -15,7 +15,11 @@ fn main() {
         .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
 
     println!("cargo:rustc-env=RTUX_VERSION={version}");
-    // Rebuild the version string when the commit or tags change.
-    println!("cargo:rerun-if-changed=.git/HEAD");
+    // Rebuild the version string when the commit or tags change. `.git/logs/HEAD`
+    // is the reliable trigger: it appends on every commit/checkout/reset. Watching
+    // `.git/HEAD` alone is NOT enough — on a branch it's a symref whose *content*
+    // ("ref: refs/heads/main") never changes when you commit, so the version would
+    // go stale on incremental local builds.
+    println!("cargo:rerun-if-changed=.git/logs/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/tags");
 }
