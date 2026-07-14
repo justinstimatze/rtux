@@ -453,8 +453,12 @@ impl Mitigator {
         let (path, label, mem, is_claude) = eligible.swap_remove(idx);
         match actions::kill_cgroup(&path) {
             Ok(_) => {
-                eprintln!("killed {} ({})", label, format_bytes(mem));
-                crate::events::record(format!("Killed {}", label));
+                // Record the swap level that justified crossing the kill gate
+                // (SWAP_HIGH_WATER) — so both the journal and `ctl history` show
+                // *why* a kill fired, making the 85% precipice auditable in the wild.
+                let swap_pct = cgroup::swap_used_fraction() * 100.0;
+                eprintln!("killed {} ({}) at swap {:.0}%", label, format_bytes(mem), swap_pct);
+                crate::events::record(format!("Killed {} (swap {:.0}%)", label, swap_pct));
                 let tail = if is_claude {
                     " You can restart this Claude session."
                 } else {

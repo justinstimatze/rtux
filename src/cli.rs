@@ -45,7 +45,10 @@ pub fn cmd_status() -> Result<()> {
 /// Talk to the running daemon's control socket. `ctl list` renders a terminal
 /// HUD of significant apps + their live state; other actions command the daemon.
 pub fn cmd_ctl(action: &str, id: Option<&str>) -> Result<()> {
-    let req = if action == "list" {
+    // `history` is a read-only view of the same `list` reply (its `recent`
+    // field) — no separate daemon endpoint, so no extra control-socket surface.
+    let read_only = matches!(action, "list" | "history");
+    let req = if read_only {
         serde_json::json!({ "cmd": "list" })
     } else {
         let id = id.context("this action needs an app id (get one from `pressured ctl list`)")?;
@@ -62,11 +65,45 @@ pub fn cmd_ctl(action: &str, id: Option<&str>) -> Result<()> {
 
     if action == "list" {
         render_hud(&v);
+    } else if action == "history" {
+        render_history(&v);
     } else {
         let ok = v["ok"].as_bool().unwrap_or(false);
         println!("{} {}", if ok { "✓" } else { "✗" }, v["msg"].as_str().unwrap_or(""));
     }
     Ok(())
+}
+
+/// Render just the recent-actions trail — "what did rtux do lately" — from a
+/// `list` reply's `recent` field, newest-first. The terminal counterpart to the
+/// HUD's activity strip: answers "did rtux touch my session?" without opening
+/// the HUD. This is an in-memory ring (capped, reset when the daemon restarts);
+/// the systemd journal (`journalctl -u rtux.service`) is the durable record.
+fn render_history(v: &serde_json::Value) {
+    let empty = vec![];
+    let events = v["recent"].as_array().unwrap_or(&empty);
+    if events.is_empty() {
+        println!("No recent interventions — rtux has been quiet.");
+        return;
+    }
+    println!("Recent rtux interventions (newest first):");
+    println!();
+    for e in events {
+        let ago = e["ago_secs"].as_u64().unwrap_or(0);
+        let text = e["text"].as_str().unwrap_or("?");
+        println!("  {:>6} ago   {}", fmt_ago(ago), text);
+    }
+}
+
+/// Compact relative age: `45s`, `12m`, `2h3m`.
+fn fmt_ago(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 fn render_hud(v: &serde_json::Value) {
