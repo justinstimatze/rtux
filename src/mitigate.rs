@@ -9,10 +9,11 @@ use crate::{actions, cgroup, notify};
 /// jumps to the front. Mirrored in `setup-hotkey.sh` and the GNOME extension.
 pub const SUMMON_HUD: &str = "pkill -KILL -x pressured-hud; for i in $(seq 50); do pgrep -x pressured-hud >/dev/null || break; sleep 0.02; done; pressured-hud";
 
-/// Cgroups we must never freeze: freezing any of these would make the desktop
-/// *less* responsive, break the session, or pause the daemon itself. Matched as
+/// Hard-exempt cgroups: the auto-mitigator must never freeze OR kill these —
+/// doing so breaks the session, the display, or the daemon itself. The session
+/// spine + system-critical services + PID 1 + the protector. Matched as
 /// substrings against both the raw cgroup dir name and the humanized app name.
-const NEVER_FREEZE: &[&str] = &[
+const HARD_EXEMPT_NAMES: &[&str] = &[
     // compositor / display
     "org.gnome.Shell", "gnome-shell", "kwin", "sway", "plasmashell",
     "Xorg", "Xwayland", "mutter",
@@ -26,18 +27,91 @@ const NEVER_FREEZE: &[&str] = &[
     "init.scope",
     // the protector itself
     "rtux", "pressured",
-    // interactive terminals — don't freeze the user's active shell
-    "vte-spawn", "gnome-terminal", "konsole", "kitty", "alacritty",
-    "xterm", "tmux", "screen",
 ];
 
-/// True if this cgroup must never be frozen (matched against raw dir name and
-/// humanized app name). Shared by the auto-mitigator and the IPC/HUD layer so
-/// both agree on what's off-limits.
+/// Interactive terminals. Spared from *automatic* freeze/kill only while they're
+/// the foreground (or descend from it) — see `denied`. A BACKGROUND terminal
+/// session (an idle shell, a build, a Claude session you're not looking at) is a
+/// legitimate target: that's where this machine's pressure actually comes from,
+/// and blanket-exempting it is why rtux used to sit helpless while the session
+/// climbed to a global-OOM crash. Still refused for user-initiated HUD actions
+/// (never_freeze stays a union), which is the conservative default there.
+const TERMINAL_NAMES: &[&str] = &[
+    "vte-spawn", "gnome-terminal", "konsole", "kitty", "alacritty",
+    "xterm", "tmux", "screen", "terminator",
+];
+
+fn matches_any(name: &str, raw_dir_name: &str, list: &[&str]) -> bool {
+    list.iter().any(|d| raw_dir_name.contains(d) || name.contains(d))
+}
+
+/// Hard-exempt from *automatic* mitigation (freeze or kill).
+fn hard_exempt(name: &str, raw_dir_name: &str) -> bool {
+    matches_any(name, raw_dir_name, HARD_EXEMPT_NAMES)
+}
+
+/// True if this cgroup must never be frozen via the IPC/HUD path. Unchanged
+/// behaviour: the hard-exempt spine *and* every terminal (the conservative
+/// default for user-initiated actions). The auto-mitigator uses the finer
+/// `hard_exempt` + foreground checks in `denied` instead.
 pub fn never_freeze(name: &str, raw_dir_name: &str) -> bool {
-    NEVER_FREEZE
+    hard_exempt(name, raw_dir_name) || matches_any(name, raw_dir_name, TERMINAL_NAMES)
+}
+
+/// True if `path` is the foreground window's cgroup, or hosts any process that
+/// descends from the foreground window's pid — i.e. the terminal the user is in
+/// and all of its tabs. Such cgroups are spared from automatic freeze/kill so we
+/// never touch what the user is actively working in. Returns false when nothing
+/// has reported focus yet (fail-open: better to act than to freeze on ambiguity
+/// under real pressure — the hard-exempt spine is still protected regardless).
+fn is_foreground_related(path: &Path) -> bool {
+    let Some(fg_pid) = crate::ipc::foreground_pid() else {
+        return false;
+    };
+    if let Some(fg_cg) = cgroup::cgroup_of_pid(fg_pid) {
+        if fg_cg == path {
+            return true;
+        }
+    }
+    let Ok(procs) = std::fs::read_to_string(path.join("cgroup.procs")) else {
+        return false;
+    };
+    procs.lines().any(|l| {
+        l.trim()
+            .parse::<i32>()
+            .map(|pid| cgroup::pid_descends_from(pid, fg_pid))
+            .unwrap_or(false)
+    })
+}
+
+/// Choose the kill victim's index from `is_claude` flags in largest-first order.
+/// Policy (B→C→A): prefer the largest *non-Claude* hog (a browser dies before a
+/// Claude session); only if there are none, take the largest Claude session.
+/// Returns None for an empty list.
+fn pick_victim_index(is_claude: &[bool]) -> Option<usize> {
+    is_claude
         .iter()
-        .any(|d| raw_dir_name.contains(d) || name.contains(d))
+        .position(|&c| !c)
+        .or_else(|| is_claude.iter().position(|&c| c))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn victim_ranking_prefers_non_claude_then_largest_first() {
+        // Empty → nothing to kill.
+        assert_eq!(pick_victim_index(&[]), None);
+        // Only Claude sessions → the largest (index 0, largest-first) is chosen.
+        assert_eq!(pick_victim_index(&[true, true, true]), Some(0));
+        // A non-Claude hog wins even when a larger Claude session precedes it.
+        assert_eq!(pick_victim_index(&[true, false, true]), Some(1));
+        // Largest non-Claude wins when several exist.
+        assert_eq!(pick_victim_index(&[false, true, false]), Some(0));
+        // Single Claude session → it's the victim (last resort, witnessed).
+        assert_eq!(pick_victim_index(&[true]), Some(0));
+    }
 }
 
 /// Don't bother freezing anything smaller than this — the churn isn't worth it.
@@ -48,10 +122,27 @@ pub const MIN_FREEZE_BYTES: u64 = 512 * 1024 * 1024; // 512 MB
 const MAX_FROZEN: usize = 3;
 /// Cap how many cgroups we'll throttle (memory.high) at the Elevated tier.
 const MAX_THROTTLED: usize = 3;
+/// Don't SIGKILL anything smaller than this — same floor as freezing.
+const MIN_KILL_BYTES: u64 = 512 * 1024 * 1024; // 512 MB
+/// Cap how many cgroups we'll SIGKILL in one pressure episode — a backstop so a
+/// misjudged episode can't cull the whole session.
+const MAX_KILLED: usize = 3;
+/// Swap-used fraction at which reclaim-to-zram is futile (nowhere left to move
+/// pages) and we jump straight to the kill rung, even before freezing is spent.
+const SWAP_HIGH_WATER: f64 = 0.85;
+/// Warn (once) when at least this many Claude sessions are running — an early,
+/// gentle nudge to close some before pressure ever forces a freeze or kill.
+const CLAUDE_SESSION_WARN_COUNT: usize = 4;
 
 pub struct Mitigator {
     frozen: Vec<(PathBuf, String)>,
     throttled: Vec<(PathBuf, String)>,
+    /// Cgroups we've SIGKILLed this episode. Kept only for the per-episode cap
+    /// and to skip re-killing — a kill is not reversible, so recover() never
+    /// touches these beyond clearing the list.
+    killed: Vec<PathBuf>,
+    /// Debounce for the "too many Claude sessions" advisory.
+    advised: bool,
     self_cgroup: Option<PathBuf>,
 }
 
@@ -60,6 +151,8 @@ impl Mitigator {
         Self {
             frozen: Vec::new(),
             throttled: Vec::new(),
+            killed: Vec::new(),
+            advised: false,
             self_cgroup: cgroup::self_cgroup(),
         }
     }
@@ -109,14 +202,22 @@ impl Mitigator {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        if never_freeze(name, &raw) {
+        // The spine/system/daemon are always off-limits (freeze OR kill).
+        if hard_exempt(name, &raw) {
             return true;
         }
-        // Never freeze ourselves, an ancestor of us, or a descendant of us.
+        // Never act on ourselves, an ancestor of us, or a descendant of us.
         if let Some(self_cg) = &self.self_cgroup {
             if self_cg.starts_with(path) || path.starts_with(self_cg) {
                 return true;
             }
+        }
+        // Spare whatever the user is actively using: the foreground window's own
+        // cgroup and anything whose processes descend from it (the terminal
+        // you're in and all its tabs). Everything else in the background is fair
+        // game — including background terminal/Claude sessions.
+        if is_foreground_related(path) {
+            return true;
         }
         false
     }
@@ -227,9 +328,126 @@ impl Mitigator {
         }
     }
 
+    /// The last rung before the kernel's own global OOM killer. When freezing is
+    /// spent (everything freezable already frozen) or swap is nearly full (so
+    /// reclaim-to-zram is futile), SIGKILL the worst *background* hog to stop the
+    /// climb. The kernel's global killer picks blindly — on 2026-07-14 it took
+    /// dbus and the whole session down; a deliberate, witnessed, ranked kill is
+    /// strictly better.
+    ///
+    /// Ranked B→C→A per the user's policy: a non-Claude background hog (a browser)
+    /// is killed before any Claude session, and a Claude kill is announced with
+    /// its directory so the session can be resumed. The foreground terminal and
+    /// the hard-exempt spine are never touched.
+    pub fn kill_worst(&mut self) {
+        // Only reach for kill once the gentler rungs are spent.
+        let swap_high = cgroup::swap_used_fraction() >= SWAP_HIGH_WATER;
+        if self.frozen.len() < MAX_FROZEN && !swap_high {
+            return;
+        }
+        if self.killed.len() >= MAX_KILLED {
+            return;
+        }
+        let candidates = match cgroup::list_freezable_cgroups() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        // Build the eligible set (largest-first, past the size floor, not exempt,
+        // not the foreground, not already killed), labelling Claude sessions.
+        let mut eligible: Vec<(PathBuf, String, u64, bool)> = Vec::new();
+        for (path, name, mem) in candidates {
+            if mem < MIN_KILL_BYTES {
+                break; // sorted largest-first — nothing bigger remains
+            }
+            if self.denied(&name, &path) || self.killed.iter().any(|p| p == &path) {
+                continue;
+            }
+            match cgroup::claude_session_label(&path) {
+                Some(label) => eligible.push((path, label, mem, true)),
+                None => eligible.push((path, name, mem, false)),
+            }
+        }
+        let flags: Vec<bool> = eligible.iter().map(|e| e.3).collect();
+        let Some(idx) = pick_victim_index(&flags) else {
+            return; // nothing eligible to kill
+        };
+        let (path, label, mem, is_claude) = eligible.swap_remove(idx);
+        match actions::kill_cgroup(&path) {
+            Ok(_) => {
+                eprintln!("killed {} ({})", label, format_bytes(mem));
+                crate::events::record(format!("Killed {}", label));
+                let tail = if is_claude {
+                    " You can restart this Claude session."
+                } else {
+                    ""
+                };
+                // Critical urgency: a kill is destructive and the user MUST see
+                // which process died (a Claude session can then be resumed), so
+                // this one punches through Do-Not-Disturb — unlike the gentler
+                // freeze/rising notices, which stay quiet by design.
+                notify::notify_session(
+                    "critical",
+                    "Stopped a memory hog to save the session",
+                    &format!(
+                        "Killed {} ({}) — the machine was about to run out of memory \
+                         and take the whole session down.{}",
+                        label,
+                        format_bytes(mem),
+                        tail
+                    ),
+                );
+                self.killed.push(path);
+            }
+            Err(e) => eprintln!("failed to kill {}: {}", path.display(), e),
+        }
+    }
+
+    /// Early, gentle nudge: if a lot of Claude sessions are running, suggest
+    /// closing some *before* pressure ever forces a freeze or kill. Debounced so
+    /// it fires once per accumulation, and resets when the count drops back.
+    pub fn advise_claude_sessions(&mut self) {
+        let candidates = match cgroup::list_freezable_cgroups() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let (mut count, mut total) = (0usize, 0u64);
+        for (path, _name, mem) in &candidates {
+            if *mem < 128 * 1024 * 1024 {
+                continue; // Claude sessions are large; skip the long tail cheaply
+            }
+            if cgroup::claude_session_label(path).is_some() {
+                count += 1;
+                total += *mem;
+            }
+        }
+        if count >= CLAUDE_SESSION_WARN_COUNT {
+            if !self.advised {
+                notify::notify_session(
+                    "normal",
+                    "A lot of Claude sessions are open",
+                    &format!(
+                        "{} Claude sessions are using {} — closing a few will keep the \
+                         machine from running low.",
+                        count,
+                        format_bytes(total)
+                    ),
+                );
+                self.advised = true;
+            }
+        } else {
+            self.advised = false;
+        }
+    }
+
     /// Pressure back to normal: undo everything this episode — thaw frozen apps
     /// and release throttles.
     pub fn recover(&mut self) {
+        // Reset the per-episode kill cap and the advisory debounce. Kills are not
+        // reversible, so there is nothing to undo — just start the next episode
+        // fresh.
+        self.killed.clear();
+        self.advised = false;
+
         // Release throttles (memory.high = max). Record it so the trail closes the
         // ledger — an "Eased off X" with no matching release is a half-story.
         for (path, name) in std::mem::take(&mut self.throttled) {
