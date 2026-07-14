@@ -15,6 +15,13 @@ use clap::{Parser, Subcommand};
 use std::thread;
 use std::time::Duration;
 
+/// Sustained seconds of normal pressure required before thawing frozen apps.
+/// PSI is a ~10s average that can rebound within seconds, so recovering on the
+/// first normal tick caused thaw/re-freeze flapping (once observed thawing and
+/// going critical again within 6s). This gate holds recovery until the calm is
+/// real.
+const RECOVER_AFTER_NORMAL_SECS: u32 = 10;
+
 #[derive(Parser)]
 #[command(
     name = "pressured",
@@ -75,8 +82,11 @@ fn protect_and_report(verbose: bool) -> bool {
         }
         Err(e) => {
             if verbose {
-                eprintln!("  warning: could not protect services: {}", e);
-                eprintln!("  hint: daemon needs write access to cgroup memory.min files");
+                // Not fatal: the cgroup can be briefly unwritable right at startup
+                // (the graphical session's cgroups are still settling). The loop
+                // retries every 30s until protection lands — so this is a note,
+                // not the alarm the old wording implied.
+                eprintln!("  note: compositor not protected yet ({e}); retrying every 30s until it lands");
             }
             false
         }
@@ -125,6 +135,7 @@ fn run_daemon() -> Result<()> {
     let mut mitigator = mitigate::Mitigator::new();
     let poll_interval = Duration::from_secs(1);
     let mut ticks: u64 = 0;
+    let mut normal_streak: u32 = 0;
 
     loop {
         ticks += 1;
@@ -149,12 +160,14 @@ fn run_daemon() -> Result<()> {
 
         match level {
             psi::PressureLevel::Critical => {
+                normal_streak = 0;
                 // Closed loop: pause the biggest freezable hog, then notify.
                 mitigator.escalate();
                 let apps = ranker::rank_apps().unwrap_or_default();
                 notifier.maybe_notify(level, &apps);
             }
             psi::PressureLevel::Elevated => {
+                normal_streak = 0;
                 // Gently throttle the biggest hog first (reversible, low-stall),
                 // and warn. Freezes are held back until Critical.
                 mitigator.throttle();
@@ -162,7 +175,13 @@ fn run_daemon() -> Result<()> {
                 notifier.maybe_notify(level, &apps);
             }
             psi::PressureLevel::Normal => {
-                mitigator.recover();
+                // Hysteresis: only thaw after pressure has stayed normal for a
+                // sustained stretch, so a brief dip doesn't thaw an app straight
+                // back into the pressure that got it frozen (see the const).
+                normal_streak = normal_streak.saturating_add(1);
+                if normal_streak >= RECOVER_AFTER_NORMAL_SECS {
+                    mitigator.recover();
+                }
             }
         }
 

@@ -47,11 +47,17 @@ pub fn notify_session(urgency: &str, summary: &str, body: &str) {
         let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid)) else { return };
         let runtime = format!("/run/user/{}", uid);
         let bus = format!("unix:path={}/bus", runtime);
+        // Inject the session-bus env *inside* the target via `env`, not via
+        // Command::env: runuser runs a PAM session that resets the environment,
+        // wiping vars we set on our side. Without them notify-send can't find the
+        // user's bus and dies with "Could not connect: Permission denied" — which
+        // is exactly why the crash-time notifications never reached the screen.
         let mut cmd = Command::new("runuser");
-        cmd.args(["-u", &user.name, "--", "notify-send"])
-            .args(args)
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .env("DBUS_SESSION_BUS_ADDRESS", &bus);
+        cmd.args(["-u", &user.name, "--", "env"])
+            .arg(format!("XDG_RUNTIME_DIR={}", runtime))
+            .arg(format!("DBUS_SESSION_BUS_ADDRESS={}", bus))
+            .arg("notify-send")
+            .args(args);
         let _ = cmd.spawn();
     } else {
         let _ = Command::new("notify-send").args(args).spawn();
@@ -97,11 +103,14 @@ pub fn notify_action(
         let user = User::from_uid(Uid::from_raw(uid)).ok().flatten()?;
         let runtime = format!("/run/user/{}", uid);
         let bus = format!("unix:path={}/bus", runtime);
+        // `env` inside the target (see notify_session) so the bus vars survive
+        // runuser's PAM environment reset.
         Command::new("timeout")
-            .args(["60", "runuser", "-u", &user.name, "--", "notify-send"])
+            .args(["60", "runuser", "-u", &user.name, "--", "env"])
+            .arg(format!("XDG_RUNTIME_DIR={}", runtime))
+            .arg(format!("DBUS_SESSION_BUS_ADDRESS={}", bus))
+            .arg("notify-send")
             .args(&ns)
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .env("DBUS_SESSION_BUS_ADDRESS", &bus)
             .output()
             .ok()?
     } else {

@@ -12,6 +12,25 @@ tag is the source of truth (the binary reports it via `pressured --version`).
   job, so pressured only ever ran when hand-started via `install.sh`. Removed the
   `After=graphical.target` ordering. Surfaced when an OOM event tore down the
   session while the daemon meant to be protecting the desktop wasn't running.
+- **oomd could still kill a protected cgroup.** `memory.min` only fends off
+  kernel reclaim, not systemd-oomd's pressure-kill — so oomd could (and did)
+  SIGKILL the compositor cgroup pressured was guarding. The daemon now also sets
+  the `user.oomd_avoid` xattr (oomd's ManagedOOMPreference=avoid) on every cgroup
+  it protects, so oomd picks it only as a last resort. Belt-and-suspenders with
+  the 80% threshold drop-in.
+- **Notifications never reached the screen.** As a root daemon it invoked
+  `notify-send` via `runuser`, but runuser's PAM session reset the environment
+  and wiped the session-bus vars, so every notice died with "Could not connect:
+  Permission denied" — the user saw nothing during the very event rtux was
+  handling. The bus env is now injected *inside* the target with `env`, immune to
+  the reset.
+- **Thaw/re-freeze flapping.** Frozen apps were thawed the instant pressure
+  touched normal, but PSI is a ~10s average that can rebound in seconds (once
+  thawed and went critical again within 6s). Recovery now waits for a sustained
+  stretch of normal pressure before thawing.
+- Softened the startup "could not protect services" message — it's a
+  self-correcting cgroup-settling race (the loop retries every 30s), not the
+  permissions alarm the old wording implied.
 
 ### Removed
 - **Tray indicator** (`pressured-tray`) and its `ksni` dependency. It duplicated

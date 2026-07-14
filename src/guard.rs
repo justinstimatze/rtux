@@ -1,11 +1,41 @@
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use crate::cgroup;
 
 const CGROUP_BASE: &str = "/sys/fs/cgroup";
+
+/// Bias systemd-oomd against killing a protected cgroup. This is the crucial
+/// companion to `memory.min`: memory.min only fends off *kernel* page reclaim,
+/// but systemd-oomd's pressure-triggered SIGKILL ignores it entirely — which is
+/// how oomd tore down the compositor cgroup out from under us mid-mitigation.
+/// The `user.oomd_avoid` xattr is oomd's ManagedOOMPreference=avoid: oomd will
+/// pick such a cgroup only as a last resort, after everything else. Best-effort
+/// — silently a no-op on kernels/filesystems that don't take the xattr.
+fn set_oomd_avoid(cgroup_path: &Path, avoid: bool) {
+    let Ok(cpath) = CString::new(cgroup_path.as_os_str().as_bytes()) else {
+        return;
+    };
+    let name = c"user.oomd_avoid";
+    unsafe {
+        if avoid {
+            let val = b"1";
+            let _ = nix::libc::setxattr(
+                cpath.as_ptr(),
+                name.as_ptr(),
+                val.as_ptr() as *const nix::libc::c_void,
+                val.len(),
+                0,
+            );
+        } else {
+            let _ = nix::libc::removexattr(cpath.as_ptr(), name.as_ptr());
+        }
+    }
+}
 
 // Single source of truth for every memory.min protection we set — compositor,
 // audio, HUD pin, and foreground alike — keyed by the protected leaf cgroup.
@@ -75,6 +105,12 @@ fn set_protection(cgroup_path: &Path, value: u64) -> Result<()> {
         prot.insert(cgroup_path.to_path_buf(), value);
     }
     apply();
+    // Also tell systemd-oomd to leave this cgroup alone (memory.min doesn't stop
+    // oomd — only this xattr does). Set on the protected leaf, not its ancestors,
+    // so oomd still has other cgroups to pick from if it must act.
+    if value > 0 {
+        set_oomd_avoid(cgroup_path, true);
+    }
     let got = cgroup::read_cgroup_u64(cgroup_path, "memory.min").unwrap_or(0);
     if value == 0 || got >= value {
         Ok(())
@@ -90,6 +126,7 @@ fn clear_protection(cgroup_path: &Path) {
         let mut prot = PROTECTIONS.lock().unwrap_or_else(|e| e.into_inner());
         prot.remove(cgroup_path);
     }
+    set_oomd_avoid(cgroup_path, false);
     apply();
 }
 
