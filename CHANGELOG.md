@@ -6,6 +6,14 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 ## [Unreleased]
 
 ### Fixed
+- **Every protection falsely reported failure (page-alignment).** The kernel
+  stores `memory.min` rounded *down* to a page (4 KB) multiple, so an unaligned
+  target like `total_ram/100` was stored a few bytes short and the verifying
+  read-back `got >= value` never held. `set_protection` then returned `Err` for
+  every service on every pass — so the daemon announced nothing, never marked
+  protection "landed", and retried forever — even though the protection *was*
+  applied. Targets are now aligned down to a page before writing, and the failure
+  message reports the actual read-back so a real failure isn't blind.
 - **A failed audio protection silently masked a successful compositor
   protection.** `protect_critical_services` protected the compositor, then the
   audio service, with `?` on each — so when the audio branch errored (its cgroup
@@ -21,6 +29,19 @@ tag is the source of truth (the binary reports it via `pressured --version`).
   pre-v0.2.0 binary.
 
 ### Added
+- **The session bus and the kernel OOM killer are now handled** — hardening after
+  a full session crash on 2026-07-14, where RAM *and* swap were exhausted, the
+  kernel's *global* OOM killer fired (bypassing both rtux and systemd-oomd), and
+  it killed `dbus.service` — collapsing the whole graphical session. Two gaps:
+  (1) the session message bus was unprotected (`memory.min=0`), so it now joins
+  the protected spine (compositor + audio + bus); (2) `memory.min` and the
+  oomd-avoid xattr don't influence the *kernel* global OOM killer at all — only
+  per-process `oom_score_adj` does — so rtux now writes `oom_score_adj=-1000` to
+  the spine's processes. On the crashed machine dbus sat at +200 (a prime victim)
+  while the memory hogs self-protected at -1000; matching the spine to -1000 lets
+  the kernel fall back to size and kill the *largest* protected process (a hog)
+  rather than tiny dbus. Applied only to services that don't fork the hogs, so
+  the protection can't leak to them by inheritance.
 - **Interventions are now witnessable under Do-Not-Disturb** (gh #1). When rtux
   acts under memory pressure while GNOME DND is on, the banner is suppressed and
   rtux's `transient` hint left nothing in the drawer either — so a freeze/reclaim

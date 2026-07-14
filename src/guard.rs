@@ -96,10 +96,26 @@ fn apply() {
     *touched = desired.keys().cloned().collect();
 }
 
+/// System page size. The kernel stores memory.min rounded DOWN to a multiple of
+/// this, so we align our targets to it — otherwise the read-back verification in
+/// set_protection reads a value a few KB below what we asked for and every
+/// protection falsely reports failure.
+fn page_size() -> u64 {
+    let ps = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) };
+    if ps > 0 { ps as u64 } else { 4096 }
+}
+
 /// Register (or update) a protection, then reconcile the tree. Returns an error
 /// only if the *target* itself couldn't be protected (e.g. no write permission),
 /// so callers like startup protection can still detect real failure.
 fn set_protection(cgroup_path: &Path, value: u64) -> Result<()> {
+    // Align down to a page multiple. The kernel floors memory.min to a page, so
+    // an unaligned target (e.g. total_ram/100) is stored a few bytes short and
+    // `got >= value` below would never hold — which made the daemon report every
+    // protection as failed, retry forever, and never announce success even though
+    // the protection was in fact applied. Losing <1 page of protection is
+    // irrelevant; the false-failure it prevents is not.
+    let value = value / page_size() * page_size();
     {
         let mut prot = PROTECTIONS.lock().unwrap_or_else(|e| e.into_inner());
         prot.insert(cgroup_path.to_path_buf(), value);
@@ -115,7 +131,13 @@ fn set_protection(cgroup_path: &Path, value: u64) -> Result<()> {
     if value == 0 || got >= value {
         Ok(())
     } else {
-        anyhow::bail!("failed to set memory.min on {}", cgroup_path.display())
+        anyhow::bail!(
+            "memory.min on {} read back as {} after requesting {} (page {})",
+            cgroup_path.display(),
+            got,
+            value,
+            page_size()
+        )
     }
 }
 
@@ -132,6 +154,34 @@ fn clear_protection(cgroup_path: &Path) {
 
 const COMPOSITOR_SERVICES: &[&str] = &["gnome-shell", "gnome.Shell", "kwin", "sway"];
 const AUDIO_SERVICES: &[&str] = &["pipewire", "pulseaudio"];
+// The session message bus. When the kernel global OOM killer took the machine
+// down on 2026-07-14 it picked *dbus.service* as its victim — killing the bus
+// collapses the whole graphical session (gnome-session, portals, gdm all fall
+// with it). memory.min alone can't prevent that (the global killer ignores it),
+// so the bus joins the protected spine and gets oom_score_adj like the rest.
+// Match the exact ".service" so we don't grab at-spi-dbus-bus.service instead.
+const SESSION_BUS_SERVICES: &[&str] = &["dbus.service"];
+
+/// oom_score_adj we bias the session spine to: -1000, the maximum protection.
+///
+/// It has to be the max, not merely "very negative". Measured on this machine
+/// (2026-07-14): dbus.service sat at +200 (practically volunteering to be the
+/// OOM victim — which is exactly what happened), while the actual memory hogs —
+/// Claude Code sessions — self-protect at oom_score_adj=-1000. Anything weaker
+/// than -1000 on the spine would still be picked *before* a -1000 hog, so the
+/// spine must at least tie them. Once spine and hogs are both at -1000 the kernel
+/// falls back to raw memory size and kills the *largest* -1000 process — a hog,
+/// not tiny dbus. The daemon itself is also -1000 but small, so it survives that
+/// size tiebreak too.
+///
+/// IMPORTANT: only apply this to spine services that are NOT process-ancestors
+/// of the memory hogs. oom_score_adj is inherited at fork, so setting it on
+/// `systemd --user` (init.scope) would leak -1000 to every user service it
+/// spawns — including the terminal/Claude/build hogs — making them *even more*
+/// unkillable. The bus and compositor don't fork the hogs (terminals do), so
+/// they're safe targets. (The hogs self-protecting at -1000 is its own problem,
+/// addressed by the explicit kill rung — a SIGKILL ignores oom_score_adj.)
+const OOM_SCORE_ADJ_PROTECT: i32 = -1000;
 
 pub struct ProtectedService {
     pub name: String,
@@ -186,6 +236,10 @@ pub fn protect_critical_services() -> Result<ProtectionReport> {
     // never let audio's fate mask it.
     protect_one("compositor", COMPOSITOR_SERVICES, compositor_memory_min(total_ram), &mut report);
     protect_one("audio", AUDIO_SERVICES, audio_memory_min(total_ram), &mut report);
+    // The session bus rounds out the spine. It's small, so a modest floor keeps
+    // it resident; its real protection (the thing that would have saved the
+    // 2026-07-14 session) is the oom_score_adj protect_one applies below.
+    protect_one("session bus", SESSION_BUS_SERVICES, spine_memory_min(total_ram), &mut report);
 
     Ok(report)
 }
@@ -197,15 +251,47 @@ pub fn protect_critical_services() -> Result<ProtectionReport> {
 fn protect_one(name: &'static str, services: &[&str], mem_min: u64, report: &mut ProtectionReport) {
     match cgroup::find_cgroup_for_service(services) {
         Ok(Some(path)) => match set_protection(&path, mem_min) {
-            Ok(()) => report.protected.push(ProtectedService {
-                name: name.to_string(),
-                cgroup_path: path,
-                memory_min: mem_min,
-            }),
+            Ok(()) => {
+                // memory.min + oomd_avoid fend off reclaim and systemd-oomd, but
+                // NOT the kernel's global OOM killer — only oom_score_adj sways
+                // that. Bias it away from the spine so a global OOM (RAM+swap
+                // both full) kills a hog, not the desktop.
+                set_oom_score_adj(&path, OOM_SCORE_ADJ_PROTECT);
+                report.protected.push(ProtectedService {
+                    name: name.to_string(),
+                    cgroup_path: path,
+                    memory_min: mem_min,
+                });
+            }
             Err(e) => report.failed.push((name, e.to_string())),
         },
         Ok(None) => report.failed.push((name, "cgroup not present yet".to_string())),
         Err(e) => report.failed.push((name, format!("lookup failed: {e}"))),
+    }
+}
+
+/// Session-spine services (the message bus) are small; a modest floor keeps their
+/// working set resident under reclaim. Their real protection is oom_score_adj —
+/// this just stops routine paging from touching them. ~0.5% of RAM, 32–128MB.
+fn spine_memory_min(total_ram: u64) -> u64 {
+    (total_ram / 200).clamp(32 * 1024 * 1024, 128 * 1024 * 1024)
+}
+
+/// Bias the kernel's *global* OOM killer away from a cgroup's processes by
+/// writing a strongly-negative oom_score_adj to each live pid. memory.min and
+/// the oomd_avoid xattr don't influence the global killer's victim choice; this
+/// does. Best-effort per pid (a pid can exit mid-loop); children inherit the adj
+/// at fork, and the daemon's retry loop re-applies it for any respawns. Only
+/// called on spine services that don't fork the hogs (see OOM_SCORE_ADJ_PROTECT).
+fn set_oom_score_adj(cgroup_path: &Path, adj: i32) {
+    let Ok(procs) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) else {
+        return;
+    };
+    for pid in procs.lines() {
+        let pid = pid.trim();
+        if !pid.is_empty() {
+            let _ = std::fs::write(format!("/proc/{pid}/oom_score_adj"), adj.to_string());
+        }
     }
 }
 
