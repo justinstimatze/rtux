@@ -46,7 +46,7 @@ enum Commands {
     Status,
     /// Query/command the running daemon over its control socket
     Ctl {
-        /// list | freeze | thaw | cap | uncap | kill | protect | unprotect
+        /// list | history | freeze | thaw | cap | uncap | kill | protect | unprotect
         action: String,
         /// app id (cgroup path from `ctl list`) — required for all actions except list
         id: Option<String>,

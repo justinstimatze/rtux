@@ -5,6 +5,39 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Fixed
+- **Every session was named a bare "claude" — a missing capability, not a naming
+  bug.** Paused/killed sessions lost the working directory that makes them
+  identifiable ("claude · rtux" → "claude"), so a kill notice named a session the
+  user had no way to place or resume. Root cause: `/proc/<pid>/cwd` is
+  ptrace-gated, and `ptrace_may_access()` only skips its capability check when the
+  reader's creds *match* the target's — so the uid-0 daemon reading a uid-1000
+  process needs `CAP_SYS_PTRACE` and otherwise gets EACCES. The unit's
+  `CapabilityBoundingSet` never granted it (being root is not sufficient), while
+  the world-readable `/proc/<pid>/comm` kept resolving — which is why this
+  presented as a cosmetic naming regression rather than a permissions failure.
+  Adding `CAP_SYS_PTRACE` (to read, never to trace) restores directory-qualified
+  labels in the HUD, the journal, and kill/pause notifications. Verify with
+  `scripts/install-verify-naming.sh`.
+
+### Added
+- **`pressured ctl history`.** The terminal counterpart to the HUD's activity
+  strip: "what did rtux just do to my machine?" answered without opening the HUD
+  — `Paused claude · rtux`, `Reclaimed 1.9GB …`, `Resumed …`, newest-first with
+  relative ages. Reuses the existing `list` reply's event ring, so it adds **no
+  new control-socket surface**. The ring is in-memory and resets with the daemon;
+  the journal (`journalctl -u rtux.service`) remains the durable record.
+- **A kill now records the swap level that justified it** — `Killed X (swap 91%)`
+  in both the journal and `ctl history`, making the `SWAP_HIGH_WATER` precipice
+  (the sole gate on the destructive rung) auditable in the wild instead of a
+  number only the source knows.
+- **`scripts/pressure-test.sh`** — an on-demand pressure harness, so the
+  mitigation ladder can be *exercised* rather than waited for. Runs a memory hog
+  in a transient user scope (rtux treats it as an ordinary app), ramps in steps
+  while printing PSI/swap, holds at peak, then releases. It self-aborts below a
+  `MemAvailable` floor, so the test can never become the out-of-memory crash it
+  exists to rehearse.
+
 ### Added
 - **CPU protection (passive weight reservation).** `memory.min` kept the
   compositor *resident*, but nothing reserved it CPU *time* — so under CPU

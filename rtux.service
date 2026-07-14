@@ -30,7 +30,18 @@ MemoryMax=64M
 # ProtectProc=/ProcSubset=, ProtectHome=, PrivateTmp= — are deliberately left off.
 # Everything below is safe with the above and still meaningfully shrinks the
 # blast radius.
-CapabilityBoundingSet=CAP_IPC_LOCK CAP_SYS_RESOURCE CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+#
+# CAP_SYS_PTRACE is required to READ (never to trace): the ptrace-gated parts of
+# /proc — notably /proc/<pid>/cwd — are what let us name a paused/killed session
+# by its working directory ("claude · rtux" rather than a bare "claude"). Being
+# uid 0 is NOT sufficient: ptrace_may_access() only skips its capability check
+# when the reader's creds MATCH the target's, so root reading a uid-1000 process
+# still needs CAP_SYS_PTRACE and otherwise gets EACCES. Without it every session
+# silently degraded to an unnamed "claude" — which is precisely the legibility
+# (which session died? can I resume it?) this daemon exists to provide. The
+# world-readable /proc/<pid>/comm kept working throughout, which is why the
+# breakage looked like a naming regression rather than a permissions one.
+CapabilityBoundingSet=CAP_IPC_LOCK CAP_SYS_RESOURCE CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectControlGroups=false
