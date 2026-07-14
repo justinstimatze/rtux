@@ -24,18 +24,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build release
-        run: cargo build --release --features hud,tray
+        run: cargo build --release --features hud
 
       - name: Package
         run: |
           V="${GITHUB_REF_NAME}"
           STAGE="rtux-${V}-x86_64-linux"
           mkdir -p "dist/$STAGE"
-          cp target/release/pressured target/release/pressured-hud \
-             target/release/pressured-tray "dist/$STAGE/"
-          # Ship the scripts users need right next to the binaries.
+          cp target/release/pressured target/release/pressured-hud "dist/$STAGE/"
+          # Ship the scripts + oomd drop-in users need right next to the binaries.
           cp install.sh uninstall.sh setup-zram.sh setup-hotkey.sh \
-             install-extension.sh rtux.service dev.pressured.Hud.desktop "dist/$STAGE/"
+             install-extension.sh rtux.service 50-pressured-oomd.conf \
+             dev.pressured.Hud.desktop "dist/$STAGE/"
           tar -czf "dist/${STAGE}.tar.gz" -C dist "$STAGE"
           (cd dist && sha256sum "${STAGE}.tar.gz" > SHA256SUMS)
 
