@@ -5,3 +5,7 @@
 .rtux-good { color: #6cc04a; }
 .rtux-warn { color: #e0a53b; }
 .rtux-crit { color: #e2504a; }
+/* Latched witness (the ◉ ring held after an intervention until the HUD is
+   opened). A soft amber glow so a *past* event catches the eye without shouting,
+   independent of the live dot colour. */
+.rtux-latched { text-shadow: 0 0 6px rgba(224, 165, 59, 0.9); }
