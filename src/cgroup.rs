@@ -296,25 +296,39 @@ pub fn pid_descends_from(mut pid: i32, ancestor: i32) -> bool {
 }
 
 /// If this cgroup hosts a Claude Code session, return a directory-qualified label
-/// (e.g. "claude (rtux)") so a kill notification says *which* session died and
+/// (e.g. "claude · rtux") so a kill notification says *which* session died and
 /// the user can resume it. None if it isn't a Claude session.
+///
+/// Robust to teardown races: the directory is read from *any* process in the
+/// scope, not just the claude process. They share the project cwd (the shell,
+/// tmux, and child procs all sit in it), so a single unreadable `/proc/pid/cwd`
+/// — common at kill time under heavy pressure — can't erase the name. This was
+/// a real miss: two sessions were killed and logged as a bare "claude" because
+/// the claude proc's cwd raced with its teardown.
 pub fn claude_session_label(cgroup_path: &Path) -> Option<String> {
     let procs = fs::read_to_string(cgroup_path.join("cgroup.procs")).ok()?;
-    for line in procs.lines() {
-        let Ok(pid) = line.trim().parse::<i32>() else { continue };
-        let comm = fs::read_to_string(format!("/proc/{}/comm", pid)).unwrap_or_default();
-        if comm.trim() == "claude" {
-            let dir = fs::read_link(format!("/proc/{}/cwd", pid))
-                .ok()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-                .filter(|d| !d.is_empty() && d != "/");
-            return Some(match dir {
-                Some(d) => format!("claude · {}", d),
-                None => "claude".to_string(),
-            });
-        }
+    let pids: Vec<i32> = procs.lines().filter_map(|l| l.trim().parse().ok()).collect();
+
+    let is_claude = pids.iter().any(|&p| {
+        fs::read_to_string(format!("/proc/{}/comm", p))
+            .map(|c| c.trim() == "claude")
+            .unwrap_or(false)
+    });
+    if !is_claude {
+        return None;
     }
-    None
+
+    // First readable, meaningful cwd from any proc in the scope.
+    let dir = pids.iter().find_map(|&p| {
+        fs::read_link(format!("/proc/{}/cwd", p))
+            .ok()
+            .and_then(|pp| pp.file_name().map(|n| n.to_string_lossy().to_string()))
+            .filter(|d| !d.is_empty() && d != "/")
+    });
+    Some(match dir {
+        Some(d) => format!("claude · {}", d),
+        None => "claude".to_string(),
+    })
 }
 
 /// Fraction of swap in use (0.0–1.0), from /proc/meminfo. When this nears 1.0

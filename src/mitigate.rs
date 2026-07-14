@@ -98,6 +98,23 @@ fn pick_victim_index(is_claude: &[bool]) -> Option<usize> {
         .or_else(|| is_claude.iter().position(|&c| c))
 }
 
+/// The name to show in a notification / activity trail for a cgroup. Terminal
+/// children (vte-spawn / tmux-spawn) resolve to their rich session label — a
+/// Claude session becomes "claude · dir" — so the user sees *what* was paused or
+/// killed instead of a generic "Terminal (child)". Everything else keeps its
+/// plain app name.
+fn display_name(path: &Path, fallback: &str) -> String {
+    let raw = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if raw.starts_with("vte-spawn") || raw.starts_with("tmux-spawn") {
+        cgroup::proc_label(path).unwrap_or_else(|| fallback.to_string())
+    } else {
+        fallback.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,8 +138,13 @@ mod tests {
 /// Public so the HUD flags "the app I'd pause first" against the same floor it
 /// actually uses (otherwise the top-consumer marker promises a pause that never comes).
 pub const MIN_FREEZE_BYTES: u64 = 512 * 1024 * 1024; // 512 MB
-/// Cap how many cgroups we'll freeze in one pressure episode.
-const MAX_FROZEN: usize = 3;
+/// Cap how many cgroups we'll freeze in one pressure episode. Generous on
+/// purpose: freezing is REVERSIBLE (pause + reclaim-to-zram, then auto-resume
+/// exactly where it left off), so pausing many background hogs is the gentle
+/// workhorse — always preferred over the destructive kill rung. On a box running
+/// a dozen background Claude sessions, 3 was far too low: it froze 3, then culled
+/// the rest. The foreground is always spared, so freezing broadly is safe.
+const MAX_FROZEN: usize = 24;
 /// Cap how many cgroups we'll throttle (memory.high) at the Elevated tier.
 const MAX_THROTTLED: usize = 3;
 /// Don't SIGKILL anything smaller than this — same floor as freezing.
@@ -236,9 +258,10 @@ impl Mitigator {
             let high = (mem / 10 * 9).max(256 * 1024 * 1024);
             match actions::cap_cgroup(&path, high) {
                 Ok(_) => {
-                    eprintln!("throttled {} to {}", name, format_bytes(high));
-                    crate::events::record(format!("Eased off {}", name));
-                    self.throttled.push((path, name));
+                    let disp = display_name(&path, &name);
+                    eprintln!("throttled {} to {}", disp, format_bytes(high));
+                    crate::events::record(format!("Eased off {}", disp));
+                    self.throttled.push((path, disp));
                 }
                 Err(e) => {
                     eprintln!("failed to throttle {}: {}", path.display(), e);
@@ -308,7 +331,7 @@ impl Mitigator {
                     // Actionable, calm notification off the main loop: a click on
                     // "Resume now" thaws exactly this app; "Open rtux" raises the HUD.
                     let p = path.clone();
-                    let n = name.clone();
+                    let n = display_name(&path, &name);
                     let sz = format_bytes(mem);
                     let reclaim_target = mem;
                     std::thread::spawn(move || {
@@ -368,8 +391,9 @@ impl Mitigator {
                             _ => {}
                         }
                     });
-                    crate::events::record(format!("Paused {}", name));
-                    self.frozen.push((path, name));
+                    let disp = display_name(&path, &name);
+                    crate::events::record(format!("Paused {}", disp));
+                    self.frozen.push((path, disp));
                 }
                 Err(e) => {
                     eprintln!("failed to freeze {}: {}", path.display(), e);
@@ -392,9 +416,12 @@ impl Mitigator {
     /// its directory so the session can be resumed. The foreground terminal and
     /// the hard-exempt spine are never touched.
     pub fn kill_worst(&mut self) {
-        // Only reach for kill once the gentler rungs are spent.
-        let swap_high = cgroup::swap_used_fraction() >= SWAP_HIGH_WATER;
-        if self.frozen.len() < MAX_FROZEN && !swap_high {
+        // Kill ONLY at the true precipice: swap nearly full, so reclaim-to-zram
+        // is futile and freezing more can't help — the machine genuinely cannot
+        // hold its working set and something must go or the kernel's blind global
+        // killer takes the session. Short of that, the (reversible) freeze rung
+        // does the work; we never kill just because a freeze count was hit.
+        if cgroup::swap_used_fraction() < SWAP_HIGH_WATER {
             return;
         }
         if self.killed.len() >= MAX_KILLED {
