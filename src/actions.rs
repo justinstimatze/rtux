@@ -36,6 +36,16 @@ pub fn kill_cgroup(cgroup_path: &Path) -> Result<()> {
         .with_context(|| format!("writing cgroup.kill to {}", cgroup_path.display()))
 }
 
+/// Set a cgroup's `cpu.weight` (1..=10000, default 100) — its proportional share
+/// of CPU among siblings under contention. Work-conserving: no effect when the
+/// cgroup isn't competing for CPU, so a boost costs nothing at idle. Requires the
+/// cpu controller enabled on the parent (see cgroup::ensure_cpu_controller).
+pub fn set_cpu_weight(cgroup_path: &Path, weight: u32) -> Result<()> {
+    let w = weight.clamp(1, 10000);
+    fs::write(cgroup_path.join("cpu.weight"), w.to_string())
+        .with_context(|| format!("writing cpu.weight to {}", cgroup_path.display()))
+}
+
 /// Ask the kernel to reclaim up to `bytes` of cold memory from a cgroup
 /// (memory.reclaim, cgroup v2 k5.19+). Anonymous pages go to swap — with zram
 /// that's fast compressed RAM. On a *frozen* app this hibernates its working set

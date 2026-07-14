@@ -5,6 +5,20 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Added
+- **CPU protection (passive weight reservation).** `memory.min` kept the
+  compositor *resident*, but nothing reserved it CPU *time* — so under CPU
+  oversubscription (a pile of parallel builds/agents; load ≫ cores) the
+  compositor and the window you're typing in waited in the run queue and input
+  lagged by a fraction of a second, which `memory.min` can't touch. rtux now
+  enables the cgroup `cpu` controller in the session subtree and raises
+  `cpu.weight` on the desktop slice (session.slice, so it out-prioritises
+  app-slice bulk work) and on the **foreground** app (via the same
+  attention-following path that pins its memory), resetting the boost when focus
+  moves. Weights are work-conserving, so this costs nothing at idle — it only
+  claims CPU when the protected thing actually needs it. (Active throttling of
+  CPU hogs under CPU-PSI is a separate, more aggressive tier, not yet shipped.)
+
 ## [0.2.1] — surviving the global OOM
 
 A full session crash on 2026-07-14 (RAM and swap both exhausted → the kernel's

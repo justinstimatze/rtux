@@ -183,6 +183,29 @@ const SESSION_BUS_SERVICES: &[&str] = &["dbus.service"];
 /// addressed by the explicit kill rung — a SIGKILL ignores oom_score_adj.)
 const OOM_SCORE_ADJ_PROTECT: i32 = -1000;
 
+/// cpu.weight for the desktop slice (session.slice) — ~10× the app-slice default
+/// so the compositor wins the scheduler over bulk app work under contention.
+/// Work-conserving, so it costs nothing when the desktop is idle.
+const CPU_WEIGHT_DESKTOP: u32 = 1000;
+/// cpu.weight for the focused app — favours it among its app-slice siblings (the
+/// scheduler dual of the foreground memory pin). Reset to default on focus change.
+const CPU_WEIGHT_FOREGROUND: u32 = 1000;
+/// The kernel default cpu.weight — what a released foreground leaf returns to.
+const CPU_WEIGHT_DEFAULT: u32 = 100;
+
+/// Give the desktop slice priority over bulk app work under CPU contention.
+/// `cpu.weight` is proportional *among siblings*, so the lever that favours the
+/// compositor (in session.slice) over the hogs (in app.slice) is session.slice's
+/// weight at the user@.service level — not the compositor leaf itself. Enabling
+/// the cpu controller down to session.slice makes its cpu.weight writable.
+fn set_desktop_cpu_priority(compositor_path: &Path) {
+    let Some(session_slice) = compositor_path.parent() else { return };
+    cgroup::ensure_cpu_controller(compositor_path);
+    if let Err(e) = crate::actions::set_cpu_weight(session_slice, CPU_WEIGHT_DESKTOP) {
+        eprintln!("  note: could not set desktop cpu.weight ({e})");
+    }
+}
+
 pub struct ProtectedService {
     pub name: String,
     pub cgroup_path: PathBuf,
@@ -240,6 +263,12 @@ pub fn protect_critical_services() -> Result<ProtectionReport> {
     // it resident; its real protection (the thing that would have saved the
     // 2026-07-14 session) is the oom_score_adj protect_one applies below.
     protect_one("session bus", SESSION_BUS_SERVICES, spine_memory_min(total_ram), &mut report);
+
+    // CPU: once the compositor is located, give the desktop slice scheduler
+    // priority over app-slice bulk work (the memory.min story, for the CPU).
+    if let Some(comp) = report.protected.iter().find(|s| s.name == "compositor") {
+        set_desktop_cpu_priority(&comp.cgroup_path);
+    }
 
     Ok(report)
 }
@@ -312,6 +341,9 @@ pub fn protect_cgroup(cgroup_path: &std::path::Path) -> Result<()> {
 /// cleared, so parent slices accumulated memory.min until reboot.)
 pub fn unprotect_cgroup(cgroup_path: &std::path::Path) -> Result<()> {
     clear_protection(cgroup_path);
+    // Drop any foreground CPU boost back to default when focus leaves this app
+    // (harmless no-op for a leaf that was never boosted).
+    let _ = crate::actions::set_cpu_weight(cgroup_path, CPU_WEIGHT_DEFAULT);
     Ok(())
 }
 
@@ -323,7 +355,12 @@ pub fn protect_foreground(cgroup_path: &std::path::Path) -> Result<()> {
     let current = cgroup::read_cgroup_u64(cgroup_path, "memory.current").unwrap_or(0);
     let total = cgroup::total_ram_bytes().unwrap_or(0);
     let cap = if total > 0 { total / 4 } else { 2 * 1024 * 1024 * 1024 };
-    set_protection(cgroup_path, current.min(cap))
+    let result = set_protection(cgroup_path, current.min(cap));
+    // CPU: favour the focused app among its slice siblings — the scheduler dual
+    // of the memory pin. unprotect_cgroup drops it back to default on focus change.
+    cgroup::ensure_cpu_controller(cgroup_path);
+    let _ = crate::actions::set_cpu_weight(cgroup_path, CPU_WEIGHT_FOREGROUND);
+    result
 }
 
 pub fn format_bytes(bytes: u64) -> String {
