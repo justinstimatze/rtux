@@ -5,6 +5,14 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+## [0.2.0] — the post-crash release
+
+Everything below was proven end-to-end under real memory pressure on
+2026-07-13: the throttle → freeze → reclaim-to-zram → recover ladder fired, the
+compositor stayed protected (oomd never touched the session), and the
+notifications landed. Also removes the redundant tray indicator and hardens the
+unit.
+
 ### Fixed
 - **Daemon silently never started at boot.** The unit's `After=graphical.target`
   combined with `WantedBy=multi-user.target` formed an ordering cycle (graphical
@@ -80,5 +88,6 @@ The initial public cut: a working, validated desktop-responsiveness daemon.
 - Installer, uninstaller, hotkey and extension setup scripts; a contained latency
   benchmark under `benchmarks/`.
 
-[Unreleased]: https://github.com/justinstimatze/rtux/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/justinstimatze/rtux/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/justinstimatze/rtux/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/justinstimatze/rtux/releases/tag/v0.1.0
