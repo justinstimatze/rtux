@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
@@ -139,6 +139,15 @@ pub struct ProtectedService {
     pub memory_min: u64,
 }
 
+/// Outcome of one protection pass. Each critical service is attempted
+/// independently: `protected` holds those secured this pass, `failed` holds the
+/// ones we tried but couldn't (with why), so the caller can report them instead
+/// of the failure vanishing.
+pub struct ProtectionReport {
+    pub protected: Vec<ProtectedService>,
+    pub failed: Vec<(&'static str, String)>,
+}
+
 /// Calculate memory.min for the compositor based on hardware heuristics.
 /// Uses a percentage of total RAM with floor/ceiling:
 ///   - 3% of total RAM
@@ -162,37 +171,42 @@ fn audio_memory_min(total_ram: u64) -> u64 {
 
 /// Discover and protect compositor + audio services.
 /// Returns the list of services that were protected.
-pub fn protect_critical_services() -> Result<Vec<ProtectedService>> {
+pub fn protect_critical_services() -> Result<ProtectionReport> {
     let total_ram = cgroup::total_ram_bytes()?;
-    let mut protected = Vec::new();
+    let mut report = ProtectionReport { protected: Vec::new(), failed: Vec::new() };
 
-    // Protect compositor
-    if let Some(path) = cgroup::find_cgroup_for_service(COMPOSITOR_SERVICES)
-        .context("searching for compositor cgroup")?
-    {
-        let mem_min = compositor_memory_min(total_ram);
-        set_protection(&path, mem_min)?;
-        protected.push(ProtectedService {
-            name: "compositor".to_string(),
-            cgroup_path: path,
-            memory_min: mem_min,
-        });
+    // Attempt each service INDEPENDENTLY. A failure in one (its cgroup not up
+    // yet, its lookup erroring, or an unwritable memory.min) must never abort
+    // protection of the others. This routine previously used `?` on each branch,
+    // so an error protecting *audio* discarded an already-successful *compositor*
+    // protection — the compositor's memory.min was written as a side effect, but
+    // the function returned Err, the daemon reported perpetual failure, and it
+    // retried (silently) every 30s forever while the compositor was in fact
+    // protected. The compositor is the load-bearing one for responsiveness;
+    // never let audio's fate mask it.
+    protect_one("compositor", COMPOSITOR_SERVICES, compositor_memory_min(total_ram), &mut report);
+    protect_one("audio", AUDIO_SERVICES, audio_memory_min(total_ram), &mut report);
+
+    Ok(report)
+}
+
+/// Best-effort protection of one service class. On success it lands in
+/// `report.protected`; on any failure it lands in `report.failed` with a reason
+/// — nothing is logged here (this runs on a 30s retry, so the *caller* decides
+/// when to log, to avoid spamming the journal every cycle).
+fn protect_one(name: &'static str, services: &[&str], mem_min: u64, report: &mut ProtectionReport) {
+    match cgroup::find_cgroup_for_service(services) {
+        Ok(Some(path)) => match set_protection(&path, mem_min) {
+            Ok(()) => report.protected.push(ProtectedService {
+                name: name.to_string(),
+                cgroup_path: path,
+                memory_min: mem_min,
+            }),
+            Err(e) => report.failed.push((name, e.to_string())),
+        },
+        Ok(None) => report.failed.push((name, "cgroup not present yet".to_string())),
+        Err(e) => report.failed.push((name, format!("lookup failed: {e}"))),
     }
-
-    // Protect audio
-    if let Some(path) = cgroup::find_cgroup_for_service(AUDIO_SERVICES)
-        .context("searching for audio cgroup")?
-    {
-        let mem_min = audio_memory_min(total_ram);
-        set_protection(&path, mem_min)?;
-        protected.push(ProtectedService {
-            name: "audio".to_string(),
-            cgroup_path: path,
-            memory_min: mem_min,
-        });
-    }
-
-    Ok(protected)
 }
 
 /// Pin a cgroup's current usage into RAM (protect it from reclaim/swap) by

@@ -5,6 +5,32 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Fixed
+- **A failed audio protection silently masked a successful compositor
+  protection.** `protect_critical_services` protected the compositor, then the
+  audio service, with `?` on each — so when the audio branch errored (its cgroup
+  lookup/write failing), the whole routine returned `Err` *after* the
+  compositor's `memory.min` was already written. The daemon then reported
+  "compositor not protected yet" forever and retried every 30s in silence, while
+  the compositor was in fact protected the whole time. Each critical service is
+  now attempted independently: the compositor (the load-bearing one for
+  responsiveness) is reported protected regardless of audio's fate, the retry
+  stops once everything critical is secured, and a service that can't be
+  protected is now logged with its reason instead of vanishing. Found while
+  reinstalling the v0.2.0 daemon — the production service had been running the
+  pre-v0.2.0 binary.
+
+### Added
+- **Interventions are now witnessable under Do-Not-Disturb** (gh #1). When rtux
+  acts under memory pressure while GNOME DND is on, the banner is suppressed and
+  rtux's `transient` hint left nothing in the drawer either — so a freeze/reclaim
+  happened with zero witness. Two fixes: the top-bar dot now *latches* a ringed
+  `◉` (with a soft amber glow) the first time pressure goes critical and holds it
+  — even after pressure clears — until the user opens the HUD; and the freeze
+  notice drops its `transient` hint so it persists in the notification drawer
+  when the banner is suppressed. The gentler rising-pressure notices stay
+  transient and still fade.
+
 ## [0.2.0] — the post-crash release
 
 Everything below was proven end-to-end under real memory pressure on

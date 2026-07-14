@@ -12,6 +12,7 @@ mod trend;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::thread;
 use std::time::Duration;
 
@@ -60,37 +61,49 @@ fn main() -> Result<()> {
 /// Attempt compositor + audio protection. Returns true if anything was protected.
 /// `verbose` prints the per-service detail on the first (startup) attempt; quiet
 /// retries only speak up when they finally succeed.
-fn protect_and_report(verbose: bool) -> bool {
-    match guard::protect_critical_services() {
-        Ok(protected) => {
-            if protected.is_empty() {
-                if verbose {
-                    eprintln!("  warning: no compositor cgroup found yet -- will retry");
-                }
-                false
-            } else {
-                for svc in &protected {
-                    println!(
-                        "  protected {} at {} (memory.min = {})",
-                        svc.name,
-                        svc.cgroup_path.display(),
-                        guard::format_bytes(svc.memory_min)
-                    );
-                }
-                true
-            }
-        }
+/// Attempt to protect the critical services, logging each one the first time it
+/// actually lands (deduped via `announced`, so a 30s retry doesn't re-announce).
+/// Returns true only when *every* critical service is protected. Failures are
+/// logged only when `verbose` — the startup pass and the moment a straggler
+/// finally lands are legible, but a persistently-unprotectable service doesn't
+/// spam the journal every 30s.
+///
+/// Each service is independent: the compositor being protected is reported even
+/// if audio can't be (a single `?` used to let audio's failure discard a
+/// successful compositor protection — see guard::protect_critical_services).
+fn protect_and_report(verbose: bool, announced: &mut HashSet<String>) -> bool {
+    let report = match guard::protect_critical_services() {
+        Ok(r) => r,
         Err(e) => {
+            // Only total_ram enumeration can fail here now — genuinely rare.
             if verbose {
-                // Not fatal: the cgroup can be briefly unwritable right at startup
-                // (the graphical session's cgroups are still settling). The loop
-                // retries every 30s until protection lands — so this is a note,
-                // not the alarm the old wording implied.
-                eprintln!("  note: compositor not protected yet ({e}); retrying every 30s until it lands");
+                eprintln!("  note: could not read memory info yet ({e}); retrying every 30s");
             }
-            false
+            return false;
+        }
+    };
+
+    for svc in &report.protected {
+        // First time this service lands, announce it — whether at startup or on a
+        // later retry (a fresh login brings the compositor cgroup up after the
+        // daemon started). Closing the ledger the old code never did.
+        if announced.insert(svc.name.clone()) {
+            println!(
+                "  protected {} at {} (memory.min = {})",
+                svc.name,
+                svc.cgroup_path.display(),
+                guard::format_bytes(svc.memory_min)
+            );
         }
     }
+
+    if verbose {
+        for (name, why) in &report.failed {
+            eprintln!("  note: {name} not protected yet ({why}); retrying every 30s until it lands");
+        }
+    }
+
+    report.failed.is_empty()
 }
 
 fn run_daemon() -> Result<()> {
@@ -124,7 +137,8 @@ fn run_daemon() -> Result<()> {
     // exists (e.g. at boot, pre-login), the compositor cgroup isn't there yet —
     // so we keep retrying in the loop until protection actually lands.
     println!("pressured: protecting critical services...");
-    let mut protected = protect_and_report(true);
+    let mut announced: HashSet<String> = HashSet::new();
+    let mut protected = protect_and_report(true, &mut announced);
 
     // Control socket for the HUD / `ctl` client.
     ipc::spawn_server();
@@ -142,7 +156,7 @@ fn run_daemon() -> Result<()> {
         // Retry compositor protection every 30s until it succeeds (login may
         // happen after the daemon starts).
         if !protected && ticks % 30 == 0 {
-            protected = protect_and_report(false);
+            protected = protect_and_report(false, &mut announced);
         }
 
         let mem_psi = match psi::read_psi("/proc/pressure/memory") {
