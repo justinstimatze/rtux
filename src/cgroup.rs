@@ -338,6 +338,38 @@ pub fn swap_used_fraction() -> f64 {
     }
 }
 
+/// Enable the `cpu` controller on every ancestor of `leaf` from the cgroup root
+/// down to leaf's parent, so `cpu.weight` becomes writable on `leaf` (and on
+/// leaf's parent). cgroup v2 exposes a controller's knobs on a cgroup only if
+/// the controller is in its parent's `cgroup.subtree_control`, and it must be
+/// enabled top-down. Best-effort: a level that already has it is skipped, and a
+/// level with processes directly in it will refuse (the no-internal-process
+/// rule) — neither is fatal.
+pub fn ensure_cpu_controller(leaf: &Path) {
+    let base = Path::new(CGROUP_BASE);
+    let mut chain: Vec<PathBuf> = Vec::new();
+    let mut cur = leaf.parent();
+    while let Some(p) = cur {
+        if !p.starts_with(base) {
+            break;
+        }
+        chain.push(p.to_path_buf());
+        if p == base {
+            break;
+        }
+        cur = p.parent();
+    }
+    chain.reverse(); // top-down: root first, then each descendant slice
+    for cg in chain {
+        let sc = cg.join("cgroup.subtree_control");
+        if let Ok(cur) = fs::read_to_string(&sc) {
+            if !cur.split_whitespace().any(|c| c == "cpu") {
+                let _ = fs::write(&sc, "+cpu");
+            }
+        }
+    }
+}
+
 /// The cgroup directory of the current process — used to avoid freezing ourselves.
 pub fn self_cgroup() -> Option<PathBuf> {
     let content = fs::read_to_string("/proc/self/cgroup").ok()?;
