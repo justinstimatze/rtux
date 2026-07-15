@@ -446,8 +446,27 @@ fn collect_freezable(dir: &Path, out: &mut Vec<(PathBuf, String, u64)>) {
         let is_unit = fname.ends_with(".scope") || fname.ends_with(".service");
         if is_unit && path.join("cgroup.freeze").exists() {
             if let Ok(mem) = read_cgroup_u64(&path, "memory.current") {
-                if mem > 0 {
-                    out.push((path.clone(), cgroup_to_app_name(&fname), mem));
+                // Rank by TOTAL FOOTPRINT (resident + swapped), not memory.current.
+                //
+                // memory.current counts only what is resident *right now*, so it
+                // COLLAPSES as a cgroup gets swapped out — under the exact pressure
+                // this daemon exists to handle. On 2026-07-14 that blindness cost a
+                // whole session: rtux sat at critical for three minutes having frozen
+                // twice, because every real hog had paged out below MIN_FREEZE_BYTES
+                // (one showed 857MB resident against 1.5GB swapped — a 2.4GB process
+                // ranked as 857MB, and a 479MB/45MB one fell under the 512MB floor
+                // entirely). The candidate list sorts largest-first and the rungs
+                // `break` at the floor, so everything looked small and both the freeze
+                // and kill rungs found nothing to do — right up until the kernel's
+                // global OOM killer took systemd --user and logged the user out.
+                //
+                // A swapped-out page is not a freed page: the cgroup still owns it and
+                // will fault it back. Footprint is what the machine must actually hold,
+                // so it is the honest thing to rank and gate on.
+                let swap = read_cgroup_u64(&path, "memory.swap.current").unwrap_or(0);
+                let footprint = mem.saturating_add(swap);
+                if footprint > 0 {
+                    out.push((path.clone(), cgroup_to_app_name(&fname), footprint));
                 }
             }
         }

@@ -5,6 +5,54 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Fixed — the 2026-07-14 session logout
+
+A second global-OOM logout, with rtux running and believing it was working. Four
+independent defects, each of which alone was enough to lose the session.
+
+- **rtux ranked by the one metric that lies under pressure.** `collect_freezable`
+  gated and sorted on `memory.current`, which counts only *resident* pages — so it
+  collapses as a cgroup swaps out, under exactly the condition rtux exists for.
+  Real hogs paged out below the 512MB floor (one showed 857MB resident against
+  1.5GB swapped: a 2.4GB process ranked as 857MB), the largest-first loop `break`s
+  at the floor, and both the freeze and kill rungs found *nothing to do*. rtux sat
+  at critical for three minutes having frozen twice, and never fired the kill rung
+  at all — while the kernel OOM proved swap was exhausted, far past the 85% gate.
+  Now ranks on **footprint = `memory.current` + `memory.swap.current`**: a swapped
+  page is not a freed page.
+- **rtux's own reclaim fired the OOM.** It forced a 4.5GB `memory.reclaim` into an
+  already-full swap (zram 6.5/7.4GB, swapfile 8.8/16GB) and the kernel's global
+  OOM killer fired *in the same second*. Reclaim is now gated on swap headroom
+  (`SWAP_RECLAIM_CEILING`) — freezing alone already stops the growth, which is the
+  part that matters.
+- **The OOM ranking was inverted, so the kernel could only kill the session.** The
+  fattest consumers self-protect at `oom_score_adj=-1000` (~7GB of Claude
+  sessions, structurally immune), while the session's own services sat at +200 and
+  `systemd --user` at +100. The kernel dutifully killed the user manager — which
+  *is* the logout. rtux now biases background hogs to +500 during pressure, giving
+  the killer a resumable victim instead of the desktop. Being un-killable is not
+  enough; someone must be *more* killable.
+- **Spine protection decayed and never came back.** The daemon re-tried protection
+  only `if !protected`, latching true after the first success. But `oom_score_adj`
+  is per-*process*: a service restart or re-login brings up new pids that never get
+  it. Measured after the logout — session dbus and pipewire sitting at +200 while
+  the daemon believed the spine was protected. Now re-asserted every 30s,
+  unconditionally.
+
+### Fixed — desktop responsiveness
+- **The compositor was half-swapped to disk.** `memory.min` only stops reclaim
+  *below* the floor; everything above it stayed fair game, and `memory.swap.max`
+  was wide open. Measured: 523MB resident vs **530MB in swap**, faulted back off
+  the on-disk swapfile (zram having long since filled) on every window switch —
+  i.e. "I can barely switch windows and the keyboard lags". Protected cgroups under
+  1/8 of RAM are now pinned out of swap entirely (`memory.swap.max=0`); larger ones
+  keep their swap door open so favouring the foreground can't turn it into a black
+  hole.
+- **Freeze notices no longer claim "moved to compressed RAM".** zram is only the
+  first swap device; once full, everything overflows to the disk swapfile. The
+  cheerful notice was describing gigabytes of disk writes that were stalling the
+  desktop it claimed to protect. Now says "paged out".
+
 ### Fixed
 - **Every session was named a bare "claude" — a missing capability, not a naming
   bug.** Paused/killed sessions lost the working directory that makes them
