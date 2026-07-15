@@ -376,24 +376,45 @@ pub fn protect_critical_services() -> Result<ProtectionReport> {
 /// — nothing is logged here (this runs on a 30s retry, so the *caller* decides
 /// when to log, to avoid spamming the journal every cycle).
 fn protect_one(name: &'static str, services: &[&str], mem_min: u64, report: &mut ProtectionReport) {
-    match cgroup::find_cgroup_for_service(services) {
-        Ok(Some(path)) => match set_protection(&path, mem_min) {
+    // EVERY matching cgroup, not just the first. A category can span several units
+    // and the first match is not a representative of the rest: "pipewire" matches
+    // pipewire-pulse.service AND pipewire.service, and protecting only the former
+    // left the real audio daemon at +200 while the log claimed audio was protected.
+    let paths = match cgroup::find_all_cgroups_for_service(services) {
+        Ok(p) => p,
+        Err(e) => {
+            report.failed.push((name, format!("lookup failed: {e}")));
+            return;
+        }
+    };
+    if paths.is_empty() {
+        report.failed.push((name, "cgroup not present yet".to_string()));
+        return;
+    }
+    for path in paths {
+        match set_protection(&path, mem_min) {
             Ok(()) => {
                 // memory.min + oomd_avoid fend off reclaim and systemd-oomd, but
                 // NOT the kernel's global OOM killer — only oom_score_adj sways
                 // that. Bias it away from the spine so a global OOM (RAM+swap
                 // both full) kills a hog, not the desktop.
                 set_oom_score_adj(&path, OOM_SCORE_ADJ_PROTECT);
+                // Name each unit by its own leaf, so the caller's announce-once
+                // ledger reports "audio (pipewire.service)" separately from
+                // "audio (pipewire-pulse.service)" instead of collapsing them and
+                // hiding a gap behind an already-announced name.
+                let leaf = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 report.protected.push(ProtectedService {
-                    name: name.to_string(),
+                    name: format!("{name} ({leaf})"),
                     cgroup_path: path,
                     memory_min: mem_min,
                 });
             }
             Err(e) => report.failed.push((name, e.to_string())),
-        },
-        Ok(None) => report.failed.push((name, "cgroup not present yet".to_string())),
-        Err(e) => report.failed.push((name, format!("lookup failed: {e}"))),
+        }
     }
 }
 

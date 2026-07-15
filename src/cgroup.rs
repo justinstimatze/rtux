@@ -4,39 +4,42 @@ use std::path::{Path, PathBuf};
 
 const CGROUP_BASE: &str = "/sys/fs/cgroup";
 
-/// Walk the cgroup tree to find a service matching one of the given names.
-/// Returns the cgroup directory path (e.g. /sys/fs/cgroup/user.slice/.../org.gnome.Shell@wayland.service).
-pub fn find_cgroup_for_service(service_names: &[&str]) -> Result<Option<PathBuf>> {
+/// Every cgroup matching any of `service_names` — not just the first.
+///
+/// A category can legitimately span several units, and stopping at the first
+/// match silently leaves the rest unprotected. Measured on 2026-07-14: "pipewire"
+/// matches BOTH `pipewire-pulse.service` and `pipewire.service`; the search found
+/// pulse, reported "protected audio", and left the actual audio daemon sitting at
+/// oom_score_adj=+200 as OOM meat — while the startup log cheerfully claimed audio
+/// was protected. Protect them all; a category is a set, not a representative.
+pub fn find_all_cgroups_for_service(service_names: &[&str]) -> Result<Vec<PathBuf>> {
     let user_slice = PathBuf::from(CGROUP_BASE).join("user.slice");
     if !user_slice.exists() {
         bail!("cgroups v2 user.slice not found at {}", user_slice.display());
     }
-    find_service_recursive(&user_slice, service_names)
+    let mut out = Vec::new();
+    collect_services_recursive(&user_slice, service_names, &mut out);
+    Ok(out)
 }
 
-fn find_service_recursive(dir: &Path, names: &[&str]) -> Result<Option<PathBuf>> {
+fn collect_services_recursive(dir: &Path, names: &[&str], out: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return Ok(None),
+        Err(_) => return,
     };
-    for entry in entries {
-        let entry = entry?;
+    for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        for svc in names {
-            if name_str.contains(svc) {
-                return Ok(Some(path));
-            }
+        let name_str = entry.file_name().to_string_lossy().to_string();
+        if names.iter().any(|svc| name_str.contains(svc)) {
+            out.push(path.clone());
+            // Don't descend into a matched unit: its own leaf is the target.
+            continue;
         }
-        if let Some(found) = find_service_recursive(&path, names)? {
-            return Ok(Some(found));
-        }
+        collect_services_recursive(&path, names, out);
     }
-    Ok(None)
 }
 
 /// Read a cgroup knob (e.g. memory.current) and return its value as bytes.
