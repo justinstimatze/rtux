@@ -203,6 +203,7 @@ fn render_hud(v: &serde_json::Value) {
         "normal"
     };
     println!("Memory pressure: {} (some avg10={:.1}%, full avg10={:.1}%)", gauge, some, full);
+    render_spine_health(v);
     println!();
     println!("{:<8} {:>9} {:>9}  {:<26} {}", "STATE", "MEM", "SWAP", "APP", "ID");
     println!("{}", "-".repeat(90));
@@ -225,6 +226,50 @@ fn render_hud(v: &serde_json::Value) {
     }
     println!();
     println!("Act with:  pressured ctl <cap|freeze|thaw|kill|protect|unprotect> <ID>");
+}
+
+/// The guarantee, as a number: is the interactive path waiting on disk?
+///
+/// This is the line the HUD was missing. Everything else it shows — pressure,
+/// swap, who's big — is a proxy or a cause; this is the outcome. rtux's whole
+/// claim is "the spine stays resident", and until now nothing on screen said
+/// whether that was true.
+///
+/// Both numbers are rates, never totals — see health.rs for why the total is a
+/// scar that never heals and would sit here permanently red.
+///
+/// The peak is shown only when it disagrees with the instant, because that is the
+/// only time it adds anything: a stall lasts a second or two and is long over by
+/// the time a human opens the HUD, so "0 now" alone would report every incident
+/// as a clean bill of health.
+///
+/// Three states, not two. "Unknown" is a real answer and gets said out loud —
+/// a meter that found no spine to read must not render as a green clean bill,
+/// which is what summing an empty set silently produces.
+fn render_spine_health(v: &serde_json::Value) {
+    // Absent entirely means an older daemon that predates the meter. Say nothing
+    // rather than print a verdict it never gave us.
+    if v.get("spine_observed").is_none() {
+        return;
+    }
+    let worst = v["spine_worst"].as_str();
+    let line = match (v["spine_faults_now"].as_u64(), v["spine_faults_peak"].as_u64()) {
+        (Some(0), Some(0)) => {
+            "\x1b[32mSpine: resident — 0 major faults/s (clean for the last minute)\x1b[0m".to_string()
+        }
+        (Some(0), Some(p)) => format!(
+            "\x1b[33mSpine: resident now — 0 major faults/s, but peaked at {p}/s in the last minute\x1b[0m"
+        ),
+        (Some(n), _) if n > 0 => format!(
+            "\x1b[31mSpine: WAITING ON DISK — {n} major faults/s{}\x1b[0m",
+            worst.map(|w| format!(" (worst: {w})")).unwrap_or_default()
+        ),
+        // observed == 0: the meter is looking at nothing. Either the session tree
+        // moved or the spine genuinely isn't there — both mean rtux is guarding
+        // something it can't find, which is worse news than any fault rate.
+        _ => "\x1b[31mSpine: UNKNOWN — rtux found no spine cgroups to measure\x1b[0m".to_string(),
+    };
+    println!("{line}");
 }
 
 fn truncate(s: &str, max: usize) -> String {

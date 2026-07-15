@@ -5,6 +5,58 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Fixed — the compositor's floor was set to a third of the compositor
+
+`compositor_memory_min` was `total_ram / 33` — 3% of RAM, capped at 1GB, a bare
+percentage whose doc comment called it "hardware heuristics". Measured 2026-07-15,
+minutes after a wake-from-lock took ~40 seconds to show a login field:
+
+    memory.min      460MB   <-- what the 3% promised
+    memory.current  781MB
+    memory.swap     538MB   <-- evicted anyway
+
+**`memory.min` was never violated — it was obeyed exactly.** It guaranteed 460MB,
+the kernel honoured 460MB, and reclaimed the 538MB above the line, because
+everything above the line is by definition fair game. The wake then faulted 38,836
+pages back off the swapfile one at a time. The most load-bearing number in the
+daemon — the one deciding whether the desktop stays resident — was a guess aimed at
+a third of its target. A guarantee aimed below its target isn't weak, it's decor.
+
+The floor is now **measured**: `memory.current + memory.swap.current`, which is
+invariant to how much has already been evicted (a squeezed compositor and a
+resident one size identically). Reading `current` alone would ratchet the floor
+down as pages left, chasing the eviction it exists to prevent. Capped at half the
+desktop reserve so a ballooning compositor can't pin the machine, and `desktop_reserve`
+is now factored out so the cap and the app ceiling cannot drift apart. On this box
+the floor goes 460MB → ~1.29GB. `memory.min` is a protection, not an allocation, so
+the unused portion costs nothing.
+
+### Added — the spine finally has a vital sign
+
+- **`health.rs`: the spine's major-fault rate, sampled every tick.** rtux's whole
+  claim is "the interactive path stays resident", and until now nothing measured
+  whether that was true. The HUD gains one line reporting it, and the daemon writes
+  a `SPINE HURT:` line to the journal when a tick crosses the threshold — so the
+  next incident leaves a record even if it happens at 3am. The standing plan is to
+  learn from the next halt; an evidence gate with no instrument behind it is a wish.
+
+  **The rate, never the total.** `pgmajfault` is monotonic — it never decreases —
+  so a cumulative reading is a scar, not a wound. Measured 22h after the incident:
+  gnome-shell's total read 182,714 while its actual rate was 0/min. A HUD wired to
+  the total would show a permanently-red number that can never improve.
+
+  Reports three states, not two: resident / waiting-on-disk / **unknown**. An empty
+  spine sums to zero faults, and zero faults would otherwise render as a confident
+  green "clean" — a blind meter posing as a healthy one, which is the same defect
+  as the display-string gate and `render_budget`'s missing-verdict default.
+
+### Note — the app.slice ceiling is validated
+
+22h of evidence: spine at 0 major faults/min, app.slice at 1,491/min (the design
+working as intended), memory PSI 0.00, and no recurrence of the halt. The ceiling
+was the fix. Per the evidence gate set when `ctl budget` shipped, admission control
+stays deliberately unwired.
+
 ### Fixed — the 2026-07-14 session logout
 
 A second global-OOM logout, with rtux running and believing it was working. Four

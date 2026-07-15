@@ -55,6 +55,20 @@ pub fn read_cgroup_u64(cgroup_path: &Path, knob: &str) -> Result<u64> {
         .with_context(|| format!("parsing {} from {}", val, path.display()))
 }
 
+/// One field out of `memory.stat`, which is `key value` lines rather than a bare
+/// number — so `read_cgroup_u64` cannot reach it.
+///
+/// Returns None rather than an error: every caller so far samples this on a timer
+/// against a cgroup that may vanish mid-flight (a service restarts, a session
+/// ends), and a missing counter is a normal event there, not a fault to report.
+pub fn read_memory_stat_field(cgroup_path: &Path, field: &str) -> Option<u64> {
+    let content = fs::read_to_string(cgroup_path.join("memory.stat")).ok()?;
+    content.lines().find_map(|line| {
+        let rest = line.strip_prefix(field)?.strip_prefix(' ')?;
+        rest.trim().parse::<u64>().ok()
+    })
+}
+
 /// Write a value to a cgroup knob.
 pub fn write_cgroup(cgroup_path: &Path, knob: &str, value: &str) -> Result<()> {
     let path = cgroup_path.join(knob);
