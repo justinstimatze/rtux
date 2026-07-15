@@ -41,10 +41,12 @@ enum Commands {
     Status,
     /// Query/command the running daemon over its control socket
     Ctl {
-        /// list | history | touch | freeze | thaw | cap | uncap | kill | protect | unprotect
+        /// list | history | budget | touch | freeze | thaw | cap | uncap | kill | protect | unprotect
         action: String,
         /// app id (cgroup path from `ctl list`) — required for all actions except
-        /// list/history/touch (touch always addresses the caller's own session)
+        /// list/history/budget/touch (touch always addresses the caller's own
+        /// session). For `budget` this slot is megabytes, not an id:
+        /// `ctl budget 2048` exits 0 if the machine can afford 2GB more, 1 if not.
         id: Option<String>,
     },
 }

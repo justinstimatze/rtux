@@ -31,6 +31,14 @@ enum Request {
     /// kernel's SO_PEERCRED peer, so a client can only ever mark *itself* live and
     /// never exempt someone else's cgroup from mitigation. See LIVE.
     Touch,
+    /// "Can this machine afford `want_mb` more right now?" — the admission-control
+    /// query. Read-only and target-less: it names no cgroup and writes nothing, so
+    /// unlike `Act` there is nothing here for `permitted_target` to guard. The only
+    /// untrusted input is an integer, and it is saturated before use.
+    Budget {
+        #[serde(default)]
+        want_mb: Option<u64>,
+    },
 }
 
 #[derive(Serialize)]
@@ -89,6 +97,40 @@ fn mem_swap() -> (u64, u64, u64, u64) {
 struct ActReply {
     ok: bool,
     msg: String,
+}
+
+#[derive(Serialize)]
+struct BudgetReply {
+    ok: bool,
+    /// "ok" | "tight" | "full". Callers should branch on THIS, not on `ok` — `ok`
+    /// only says the daemon answered, not that the answer was yes.
+    verdict: String,
+    reason: String,
+    headroom_bytes: u64,
+    ceiling_bytes: Option<u64>,
+    app_current_bytes: u64,
+    mem_available_bytes: u64,
+    psi_some_avg10: f64,
+    want_bytes: u64,
+}
+
+fn build_budget(want_mb: Option<u64>) -> BudgetReply {
+    // Saturate rather than wrap: `want_mb` is untrusted, and u64::MAX MB would
+    // otherwise overflow into a small number and turn a preposterous ask into an
+    // "ok". Saturating means an absurd ask reads as absurd and gets refused.
+    let want = want_mb.map(|mb| mb.saturating_mul(1024 * 1024));
+    let b = guard::budget(want);
+    BudgetReply {
+        ok: true,
+        verdict: b.verdict.to_string(),
+        reason: b.reason,
+        headroom_bytes: b.headroom,
+        ceiling_bytes: b.ceiling,
+        app_current_bytes: b.app_current,
+        mem_available_bytes: b.mem_available,
+        psi_some_avg10: b.psi_some_avg10,
+        want_bytes: want.unwrap_or(0),
+    }
 }
 
 /// Start the control socket in a background thread. Failures here are non-fatal:
@@ -154,6 +196,7 @@ fn handle(stream: UnixStream) -> std::io::Result<()> {
         Ok(Request::Foreground { pid }) => serde_json::to_string(&do_foreground(pid)),
         // Same trust rule as PinSelf: the kernel's peer, never a client's claim.
         Ok(Request::Touch) => serde_json::to_string(&do_touch(peer_pid)),
+        Ok(Request::Budget { want_mb }) => serde_json::to_string(&build_budget(want_mb)),
         Err(e) => serde_json::to_string(&ActReply {
             ok: false,
             msg: format!("bad request: {}", e),

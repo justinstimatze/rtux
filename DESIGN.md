@@ -291,6 +291,73 @@ recorded here so none of it gets rediscovered or silently re-added:
   times the tool was broken, not the daemon. Scripts under `scripts/` now pin
   themselves to the running binary and the current unit start time.
 
+## Measure harm, not swap
+
+`memory.swap.current` is the wrong number to optimize, and staring at it costs
+real time (2026-07-14: a whole afternoon). Swap is the *goal* for app.slice —
+every page an app has on disk is a page the desktop didn't have to give up. The
+harm was never swapping; the harm is **a major fault on the interactive path at
+the moment of interaction**. The 19s stall was not "the input method was swapped",
+it was "the input method was swapped *and a key was pressed*". A cold buffer
+nobody touches costs nothing.
+
+So the metric is `pgmajfault` on the spine, not `swap.current` anywhere. Measured
+9.5h after the realignment landed:
+
+    app.slice (all apps)   15,752,391 major faults
+    entire spine              ~100,000 major faults
+
+Two orders of magnitude. That gap *is* the partition working: 15.7M times the
+kernel chose to make a background job wait instead of the user. A spine
+pgmajfault **rate** belongs in the HUD — it is the only honest way to see whether
+the guarantee is holding, and its absence is why a benign cache statistic was
+able to masquerade as an incident for an afternoon.
+
+## Levers not yet pulled
+
+Ranked by how much of "things chug to a halt all the goddamn time" each one
+actually removes. Recorded 2026-07-14, after the realignment.
+
+1. **Admission control — half built, deliberately stopped.** Everything else rtux
+   does is post-hoc: pressure arrives, we react. The prior art is unanimous that the
+   guarantee never comes from clever scheduling — it comes from *refusing work that
+   doesn't fit*. (`advise_claude_sessions` is **not** this: it notifies after the
+   sessions are already running, and can be ignored.)
+
+   The primitive exists: **`ctl budget [MB]`** answers "can this machine afford N
+   more right now?" and exits 0/1/2. It can only exist because the `app.slice`
+   ceiling is a standing partition — headroom under it is a real number rather than
+   a vibe. Without a ceiling there is no denominator and the only honest answer is
+   "try it and find out", which is the reactive posture the ceiling replaced.
+
+   **Nothing calls it, on purpose.** The obvious caller — a PreToolUse gate on
+   agent fan-out — was measured before building and turns out to gate a non-cost:
+   subagents are extra contexts inside one existing process, not new processes, so
+   a fan-out adds no cgroup and no GB. Estimate high and such a gate denies
+   everything; estimate honestly and it never fires. Either way it is theatre.
+
+   The measured arithmetic is different, and it moved the target. A Claude session
+   costs ~1GB **only while active**; idle ones sit swapped and cost nearly nothing
+   (observed: 7 sessions, 4.2GB resident against an 11.4GB ceiling, PSI 0.0). So the
+   halt is a *concurrency* problem — how many sessions are busy at once — not a
+   count problem, and count-based admission control doesn't touch it.
+
+   Stopped here for evidence rather than guessing a third time (2026-07-14). The
+   ceiling is hours old and the halt has not recurred since; if it doesn't, the
+   ceiling was the fix and any gate would be dead code. If it does, the recurrence
+   says what to gate on. Wiring a caller before then would repeat the day's actual
+   lesson — building on an unmeasured premise — with more ceremony.
+
+2. **Nothing protects the terminal the user is typing into.** The rule is: mouse,
+   typing, sound, WM, drawing — protected hard. But *typing* includes the window
+   the typing lands in, and that window sits in `app.slice`, under the ceiling,
+   expendable (measured: 30,900 major faults in the user's terminal). The spine
+   protects the input *method* and then hands the keystroke to an unprotected app.
+   Focus-following (attention-following, above) is the missing half of "protect
+   typing" — the focused window is part of the interactive path *while focused*.
+
+3. **The guarantee is invisible.** See "Measure harm, not swap" above.
+
 ## Status
 
 **Validated in the wild (2026-07-12):** the full auto-mitigation fired under real

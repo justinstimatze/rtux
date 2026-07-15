@@ -784,6 +784,173 @@ fn set_bulk_ceiling(compositor_path: &Path) {
     }
 }
 
+/// Locate the desktop session's `app.slice` — the cgroup the bulk ceiling is set
+/// on, and therefore the denominator of every budget question.
+///
+/// Globs rather than taking a uid, because the daemon runs as root and has no
+/// session of its own to ask. Returns None if there is more than one graphical
+/// session: with two, "the" app.slice is not a well-formed question, and guessing
+/// would silently answer for the wrong user.
+pub fn app_slice_path() -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
+    let entries = std::fs::read_dir("/sys/fs/cgroup/user.slice").ok()?;
+    for user_slice in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+        let is_user_slice = user_slice
+            .file_name()
+            .map(|n| {
+                let n = n.to_string_lossy();
+                n.starts_with("user-") && n.ends_with(".slice")
+            })
+            .unwrap_or(false);
+        if !is_user_slice {
+            continue;
+        }
+        let Ok(inner) = std::fs::read_dir(&user_slice) else { continue };
+        for mgr in inner.filter_map(|e| e.ok()).map(|e| e.path()) {
+            let is_mgr = mgr
+                .file_name()
+                .map(|n| {
+                    let n = n.to_string_lossy();
+                    n.starts_with("user@") && n.ends_with(".service")
+                })
+                .unwrap_or(false);
+            if !is_mgr {
+                continue;
+            }
+            let app = mgr.join("app.slice");
+            if app.is_dir() {
+                if found.is_some() {
+                    return None; // >1 graphical session — refuse to guess
+                }
+                found = Some(app);
+            }
+        }
+    }
+    found
+}
+
+/// The answer to "can this machine afford N more bytes of app, right now?"
+///
+/// This is rtux's admission-control primitive, and the reason it can exist at all
+/// is the bulk ceiling: `app.slice memory.high` is a standing partition, so
+/// "headroom" is a real number rather than a vibe. Without a ceiling there is no
+/// denominator and the only honest answer is "dunno, try it and find out" — which
+/// is precisely the reactive posture the ceiling was introduced to replace.
+///
+/// Read-only by construction: it opens no writable file and takes no target, so it
+/// is safe to expose on a socket any desktop process can reach.
+pub struct Budget {
+    /// What a new app may take before it hits a wall — the tighter of the two real
+    /// limits, never an average of them.
+    pub headroom: u64,
+    /// app.slice memory.high, or None if the ceiling isn't set (no session yet).
+    pub ceiling: Option<u64>,
+    pub app_current: u64,
+    pub mem_available: u64,
+    pub psi_some_avg10: f64,
+    /// "ok" | "tight" | "full" — the caller's decision, pre-chewed.
+    pub verdict: &'static str,
+    pub reason: String,
+}
+
+/// Refuse admission while the machine is already in trouble. Letting new work in
+/// during an incident is how a recoverable climb becomes an OOM: the whole point
+/// of admission control is that it says no *before* the ladder is needed, and a
+/// gate that opens under pressure is not a gate.
+const BUDGET_DENY_ABOVE_PSI: f64 = 20.0;
+
+pub fn budget(want: Option<u64>) -> Budget {
+    let avail = mem_available();
+    let psi_some_avg10 = crate::psi::read_psi("/proc/pressure/memory")
+        .map(|r| r.some.avg10)
+        .unwrap_or(0.0);
+
+    let app_slice = app_slice_path();
+    let ceiling = app_slice
+        .as_ref()
+        .and_then(|p| cgroup::read_cgroup_u64(p, "memory.high").ok());
+    let app_current = app_slice
+        .as_ref()
+        .and_then(|p| cgroup::read_cgroup_u64(p, "memory.current").ok())
+        .unwrap_or(0);
+
+    // Two independent walls, and a new app has to clear BOTH: the standing
+    // partition (how much apps are allowed to hold) and physical reality (how much
+    // is actually there). Take the tighter — averaging them would invent headroom
+    // that doesn't exist on whichever axis is really binding.
+    let ceiling_headroom = ceiling.map(|c| c.saturating_sub(app_current));
+    let headroom = match ceiling_headroom {
+        Some(ch) => ch.min(avail),
+        None => avail,
+    };
+
+    let (verdict, reason) = budget_verdict(headroom, ceiling, avail, psi_some_avg10, want);
+
+    Budget { headroom, ceiling, app_current, mem_available: avail, psi_some_avg10, verdict, reason }
+}
+
+/// The decision itself, split out from the system reads so it can be tested. Every
+/// input is a plain number; there is no I/O below this line.
+fn budget_verdict(
+    headroom: u64,
+    ceiling: Option<u64>,
+    avail: u64,
+    psi_some_avg10: f64,
+    want: Option<u64>,
+) -> (&'static str, String) {
+    if psi_some_avg10 >= BUDGET_DENY_ABOVE_PSI {
+        (
+            "full",
+            format!(
+                "the machine is already under memory pressure (PSI some.avg10 = {psi_some_avg10:.1}) \
+                 — let it settle before starting more"
+            ),
+        )
+    } else if ceiling.is_none() {
+        // No ceiling means no partition means no denominator. Say so rather than
+        // quietly answering from MemAvailable alone and implying a guarantee the
+        // standing layer isn't actually making.
+        (
+            "tight",
+            format!(
+                "no app.slice ceiling is set (no graphical session yet?) — answering from \
+                 MemAvailable alone, which is a snapshot, not a guarantee: {} free",
+                format_bytes(avail)
+            ),
+        )
+    } else if let Some(want) = want {
+        if want > headroom {
+            (
+                "full",
+                format!(
+                    "{} asked, {} headroom — starting this would push apps into the ceiling \
+                     and everything in app.slice would be throttled into reclaim",
+                    format_bytes(want),
+                    format_bytes(headroom)
+                ),
+            )
+        } else if want.saturating_mul(2) > headroom {
+            (
+                "tight",
+                format!(
+                    "{} asked, {} headroom — it fits, but leaves little behind it",
+                    format_bytes(want),
+                    format_bytes(headroom)
+                ),
+            )
+        } else {
+            (
+                "ok",
+                format!("{} asked, {} headroom", format_bytes(want), format_bytes(headroom)),
+            )
+        }
+    } else if headroom == 0 {
+        ("full", "apps are at the ceiling".to_string())
+    } else {
+        ("ok", format!("{} headroom", format_bytes(headroom)))
+    }
+}
+
 /// Discover and protect compositor + audio services.
 /// Returns the list of services that were protected.
 pub fn protect_critical_services() -> Result<ProtectionReport> {
@@ -994,6 +1161,65 @@ mod tests {
         // Releasing everything clears the map entirely — no residue.
         p.clear();
         assert!(desired_min_map(&p, base).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{budget_verdict, BUDGET_DENY_ABOVE_PSI};
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    fn verdict(headroom: u64, psi: f64, want: Option<u64>) -> &'static str {
+        budget_verdict(headroom, Some(11 * GB), 5 * GB, psi, want).0
+    }
+
+    #[test]
+    fn refuses_during_an_incident_however_much_headroom_the_numbers_claim() {
+        // The whole reason admission control exists. Headroom can look enormous
+        // mid-climb (MemAvailable counts reclaimable page cache that is *already*
+        // being fought over), so an arithmetic-only gate would wave work in during
+        // exactly the incident it was built to prevent.
+        assert_eq!(verdict(8 * GB, BUDGET_DENY_ABOVE_PSI, Some(GB)), "full");
+        assert_eq!(verdict(8 * GB, 90.0, Some(1)), "full");
+    }
+
+    #[test]
+    fn admits_when_the_ask_fits_with_room_behind_it() {
+        assert_eq!(verdict(8 * GB, 0.0, Some(GB)), "ok");
+    }
+
+    #[test]
+    fn fits_but_barely_is_tight_not_ok() {
+        // 3GB into 4GB fits, but leaves 1GB — admit, and say so.
+        assert_eq!(verdict(4 * GB, 0.0, Some(3 * GB)), "tight");
+        // Exactly half is the boundary: want*2 == headroom is NOT > headroom.
+        assert_eq!(verdict(4 * GB, 0.0, Some(2 * GB)), "ok");
+    }
+
+    #[test]
+    fn refuses_an_ask_larger_than_headroom() {
+        assert_eq!(verdict(GB, 0.0, Some(4 * GB)), "full");
+    }
+
+    #[test]
+    fn an_absurd_ask_is_refused_rather_than_wrapping_into_a_yes() {
+        // Guards the saturating_mul in ipc::build_budget: u64::MAX must read as
+        // absurd, not wrap to a small number and get admitted.
+        assert_eq!(verdict(8 * GB, 0.0, Some(u64::MAX)), "full");
+    }
+
+    #[test]
+    fn no_ceiling_is_tight_and_never_ok() {
+        // No partition means no denominator. Answering "ok" from MemAvailable alone
+        // would imply a guarantee the standing layer isn't making.
+        let (v, why) = budget_verdict(5 * GB, None, 5 * GB, 0.0, Some(GB));
+        assert_eq!(v, "tight");
+        assert!(why.contains("no app.slice ceiling"), "reason should name the cause: {why}");
+    }
+
+    #[test]
+    fn at_the_ceiling_with_no_ask_is_full() {
+        assert_eq!(verdict(0, 0.0, None), "full");
     }
 }
 
