@@ -195,6 +195,102 @@ rtux stands on — and deliberately departs from — existing work:
   [framing](https://en.wikipedia.org/wiki/Calm_technology) is the north star for
   the ambient/peripheral UX direction.
 
+## Standing guarantees, not reactive rungs
+
+The organizing principle, arrived at the hard way (see the postmortem below). A
+*standing* guarantee is config written once and left in force: the spine's
+`memory.min`, `swap.max=0`, `oom_score_adj`, the `app.slice` ceiling, the CPU
+weight boost, swap fault-in. A *reactive* rung is something the PSI loop does
+after pressure arrives: freeze, reclaim, kill.
+
+Standing guarantees are the product. Reactive rungs are the backstop, and the
+backstop firing at all is a partial failure of the standing layer. PSI is a ~10s
+average — by the time it crosses a threshold the user has already felt the stall,
+so anything that only *starts working* at that point is late by construction. The
+whole reactive ladder is what remains after the standing layer has been outrun; it
+is not the mechanism by which the desktop stays fast.
+
+The practical test for any new lever: does it hold a guarantee *before* trouble,
+or does it react *to* trouble? Prefer the first. Add the second only as a
+last resort, and only when it can't be expressed as the first.
+
+## Postmortem: the 2026-07-14 incident
+
+Two failures in one day — a kernel global OOM that killed `systemd --user` (taking
+the session with it), and ~19s of keyboard latency. What the cleanup established,
+recorded here so none of it gets rediscovered or silently re-added:
+
+- **cgroup v2 has no `cpu.min`.** Its four resource models are Weights / Limits /
+  Protections / Allocations, and `cpu.weight` is a Weight: a share of
+  `w_i / Σ w_active`, where the denominator floats with whatever else is runnable.
+  There is no way to express a CPU *floor*. A reactive CPU-throttle rung once
+  existed here on the theory that saturated cores cause input lag; it was deleted.
+  Measured during the actual stall: `cpu` PSI `some.avg10 = 2.28` (cores idle)
+  against `io` PSI `some.avg10 = 34.82`. Typing lagged because the input method was
+  on a *disk* swapfile and every keypress took a major fault. The cores were never
+  the problem. What survives is the standing weight boost — honest about being a
+  preference rather than a guarantee.
+
+- **`oom_badness()` scores on RSS.** Pinning a service resident without also
+  biasing `oom_score_adj` makes it a *more* attractive global-OOM victim, because
+  you just made it bigger. Protection and biasing must ship together or the
+  protection is an accelerant. `memory.min` and the oomd `avoid` xattr do not
+  influence the kernel's global killer at all; only `oom_score_adj` does.
+
+- **`memory.swap.max=0` is prophylactic, never curative.** It forbids *future*
+  swap-out. It does not recall a page that is already gone, so a service that got
+  evicted before protection landed stays slow forever. Hence fault-in: walk the
+  pids' swapped pages and touch them back into RAM. This is why protection has to
+  be a standing obligation re-asserted on a timer, not a one-shot at startup.
+
+- **Shmem swap cannot be faulted in by touching addresses.** An evicted shmem page
+  (tmpfs, `wl_shm`, dma-buf, Xwayland pixmaps) leaves no swap PTE in the mapper —
+  the shmem inode owns the slot — so `memory.swap.current` counts it while no
+  process admits to it and no address touch can reach it. Fault-in handles the anon
+  share, which is what the latency-critical units (input method, audio, session bus,
+  the user's terminal) are made of.
+
+  The corollary, learned by getting it wrong: **do not diagnose shmem by comparing
+  `memory.stat anon` to `memory.swap.current`.** `anon` counts *resident* anonymous
+  memory, so a page that swaps out leaves the counter by definition; the comparison
+  is vacuous and reads as convincing anyway. The real discriminator is smaps `Swap:`
+  summed over the cgroup's pids versus `memory.swap.current` — it asks the only
+  question that matters: is there a swap PTE to touch?
+
+  And the shmem gap is not damage to be repaired — it is a cache that breathes.
+  Watched over minutes with RAM free, the compositor's swap ranged 551MB → 120MB →
+  461MB while its resident shmem swung between roughly 0.4GB and 4.3GB: the kernel
+  evicting cold client buffers and faulting back hot ones, exactly as a cache
+  should. Do not read a low sample as "healed" or a high one as "damaged" — the
+  first draft of this section did the former, on one sample, and called it a trend.
+  The lever that matters is making room (the `app.slice` ceiling), not touching
+  addresses; and what actually needs measuring here is compositor *latency*, not the
+  swap counter, which is a cache statistic wearing a scary number.
+
+- **Never let a display string be a gate.** `protect_critical_services` returned
+  services whose `name` had become `"compositor (org.gnome.Shell@ubuntu.service)"`
+  for logging, while two callers still did `find(|s| s.name == "compositor")`. Both
+  silently matched nothing — a `find` that matches nothing is indistinguishable from
+  a compositor that isn't running, so it printed no error. The CPU boost was dead
+  from that commit onward, and stale cgroup values from before it made the feature
+  look alive. Anything code dispatches on now lives in a separate stable `class`
+  field, with a test asserting the literal exists.
+
+- **Measure progress, not effort.** Fault-in's first version budgeted *pages
+  touched*, so the compositor spent its entire budget faulting already-resident
+  pages inside huge shmem VMAs and recalled nothing. It now filters candidates
+  through `/proc/<pid>/pagemap` bit 62 (swapped) and budgets pages actually out.
+  Relatedly, it reports what it *touched* rather than the cgroup's swap delta: the
+  target is a live process the kernel is concurrently faulting in and evicting, so
+  `before - after` folds the kernel's work into ours and would invent successes.
+
+- **A broken tool is not a measurement.** Two conclusions this day were nearly drawn
+  from tooling that failed silently: `sudo -n` returns nothing useful without a TTY
+  (it looks like an empty result, not an error), and a verification script that
+  grepped the whole journal replayed a *previous* run's verdict as current. Both
+  times the tool was broken, not the daemon. Scripts under `scripts/` now pin
+  themselves to the running binary and the current unit start time.
+
 ## Status
 
 **Validated in the wild (2026-07-12):** the full auto-mitigation fired under real

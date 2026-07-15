@@ -329,16 +329,53 @@ fn do_touch(pid: Option<i32>) -> ActReply {
         };
     };
     let now = std::time::Instant::now();
-    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    // Drop this cgroup's old entry and anything expired, then re-add at the front
-    // so the newest touch wins the truncation below.
-    live.retain(|(p, t)| p != &cg && now.duration_since(*t) < TOUCH_TTL);
-    live.insert(0, (cg.clone(), now));
-    live.truncate(MAX_LIVE);
-    let name = cgroup::proc_label(&cg).unwrap_or_else(|| "session".to_string());
+    let (expired, name) = {
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        // Drop this cgroup's old entry and anything expired, then re-add at the
+        // front so the newest touch wins the truncation below. Whatever falls out
+        // (aged out, or pushed past MAX_LIVE) must be released, or the pins leak.
+        let mut expired: Vec<std::path::PathBuf> = Vec::new();
+        live.retain(|(p, t)| {
+            let keep = p != &cg && now.duration_since(*t) < TOUCH_TTL;
+            if !keep && p != &cg {
+                expired.push(p.clone());
+            }
+            keep
+        });
+        live.insert(0, (cg.clone(), now));
+        let keep = MAX_LIVE.min(live.len());
+        for (p, _) in live.drain(keep..) {
+            expired.push(p);
+        }
+        (expired, cgroup::proc_label(&cg).unwrap_or_else(|| "session".to_string()))
+    };
+
+    // Hand back sessions the human has moved on from.
+    for p in expired {
+        let _ = guard::unprotect_cgroup(&p);
+    }
+
+    // Make it RESIDENT — not merely unfrozen.
+    //
+    // Sparing a session from freeze was never enough, and assuming it was is why
+    // typing stayed laggy through a whole day of "fixes". Measured on the session
+    // the user was actively typing in: memory.min=0, memory.swap.max=max, and 43%
+    // of it (369MB of an 820MB footprint) paged out — onto the DISK swapfile,
+    // since zram was 100% full. Every keystroke woke claude, touched an evicted
+    // page, and paid a disk fault: io PSI sat at ~35% sustained while cpu PSI was
+    // ~2, so this was never the CPU contention the throttling rungs were built
+    // for. rtux hardened the compositor and left the terminal — the one process
+    // that has to render every character — entirely unprotected.
+    //
+    // protect_foreground pins the pages (memory.min), forbids swapping for
+    // anything under 1/8 RAM (memory.swap.max=0), and boosts cpu.weight. That is
+    // what "the window you're in is always instant" has to mean under tmux, where
+    // the focused-window path can't see the pane at all.
+    let _ = guard::protect_foreground(&cg);
+
     ActReply {
         ok: true,
-        msg: format!("{} is live — spared for {}s", name, TOUCH_TTL.as_secs()),
+        msg: format!("{} is live — pinned resident for {}s", name, TOUCH_TTL.as_secs()),
     }
 }
 
