@@ -26,6 +26,11 @@ enum Request {
     /// window you're in is always instant. Client-agnostic (shell ext,
     /// AT-SPI, …).
     Foreground { pid: i32 },
+    /// A session reports that a human just interacted with it ("I was typed in").
+    /// Carries NO pid on purpose: the caller's own cgroup is resolved from the
+    /// kernel's SO_PEERCRED peer, so a client can only ever mark *itself* live and
+    /// never exempt someone else's cgroup from mitigation. See LIVE.
+    Touch,
 }
 
 #[derive(Serialize)]
@@ -147,6 +152,8 @@ fn handle(stream: UnixStream) -> std::io::Result<()> {
         // identified by the kernel.
         Ok(Request::PinSelf { .. }) => serde_json::to_string(&do_pin_self(peer_pid)),
         Ok(Request::Foreground { pid }) => serde_json::to_string(&do_foreground(pid)),
+        // Same trust rule as PinSelf: the kernel's peer, never a client's claim.
+        Ok(Request::Touch) => serde_json::to_string(&do_touch(peer_pid)),
         Err(e) => serde_json::to_string(&ActReply {
             ok: false,
             msg: format!("bad request: {}", e),
@@ -273,6 +280,75 @@ static FOREGROUND_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI
 pub fn foreground_pid() -> Option<i32> {
     let p = FOREGROUND_PID.load(std::sync::atomic::Ordering::Relaxed);
     (p > 0).then_some(p)
+}
+
+/// Cgroups a human has recently interacted with, newest-first.
+///
+/// Why this exists: under tmux, foreground-sparing is not merely weakened — it is
+/// **inoperative**. A pane's processes descend from the tmux *server*, which
+/// systemd parents to `systemd --user`, so the chain from the pane never reaches
+/// the focused terminal window and `pid_descends_from` reports even the pane
+/// under your fingers as background. It was freezable while being typed in.
+///
+/// Nothing observable from outside fixes this:
+///   * every tmux client descends from the *same* terminal-emulator pid (one
+///     process, N tabs), so the focused tab is invisible at pid granularity;
+///   * tmux counts *output* as activity, so `client_activity` ranks a chatty
+///     background agent above the human (measured: it picked a busy background
+///     session while the user was demonstrably typing in another).
+///
+/// So the session tells us instead — a UserPromptSubmit hook pings the socket the
+/// moment a prompt is submitted. "A human typed here" is a fact only the session
+/// has, and it is exactly the right sparing signal.
+static LIVE: std::sync::Mutex<Vec<(std::path::PathBuf, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+/// How long a touched cgroup stays spared. Long enough to cover reading/thinking
+/// between prompts; short enough that a session you walked away from returns to
+/// the freezable pool on its own.
+const TOUCH_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// Cap on the spared set. Bounds the honest case (cycling between a few panes)
+/// and the pathological one (a process spamming touch to make itself
+/// unfreezable): the mitigator must never be starved of candidates, or we're back
+/// to the helpless climb that ended in a global-OOM session kill.
+const MAX_LIVE: usize = 3;
+
+/// Mark the CALLER's own cgroup as live. `pid` is the kernel-reported peer
+/// (SO_PEERCRED), never a client-supplied value — so this can only ever spare the
+/// caller's own session, which is the whole security story for this endpoint.
+fn do_touch(pid: Option<i32>) -> ActReply {
+    let Some(pid) = pid else {
+        return ActReply {
+            ok: false,
+            msg: "refused: could not verify the calling process".into(),
+        };
+    };
+    let Some(cg) = cgroup::cgroup_of_pid(pid) else {
+        return ActReply {
+            ok: false,
+            msg: format!("no cgroup for pid {}", pid),
+        };
+    };
+    let now = std::time::Instant::now();
+    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    // Drop this cgroup's old entry and anything expired, then re-add at the front
+    // so the newest touch wins the truncation below.
+    live.retain(|(p, t)| p != &cg && now.duration_since(*t) < TOUCH_TTL);
+    live.insert(0, (cg.clone(), now));
+    live.truncate(MAX_LIVE);
+    let name = cgroup::proc_label(&cg).unwrap_or_else(|| "session".to_string());
+    ActReply {
+        ok: true,
+        msg: format!("{} is live — spared for {}s", name, TOUCH_TTL.as_secs()),
+    }
+}
+
+/// True if a human interacted with this cgroup recently. Also matches when the
+/// touched cgroup lives *under* `path`, so sparing a pane spares its ancestors.
+pub fn touched_recently(path: &std::path::Path) -> bool {
+    let now = std::time::Instant::now();
+    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    live.iter()
+        .any(|(p, t)| now.duration_since(*t) < TOUCH_TTL && (p == path || p.starts_with(path)))
 }
 
 /// Pin the focused app resident and relax the previous one. Session-critical

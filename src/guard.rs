@@ -100,6 +100,32 @@ fn apply() {
 /// this, so we align our targets to it — otherwise the read-back verification in
 /// set_protection reads a value a few KB below what we asked for and every
 /// protection falsely reports failure.
+/// Is this cgroup small enough to hold wholly in RAM? Pinning something out of
+/// swap reserves its entire footprint, so the lever only makes sense for things
+/// whose whole point is instant response and whose size is bounded: the session
+/// spine and the focused terminal. Ceiling is 1/8 of RAM (~1.9GB on a 15GB box) —
+/// comfortably above a compositor (~1GB) or a terminal (~250MB), and safely below
+/// a browser.
+fn swap_pin_eligible(cgroup_path: &Path) -> bool {
+    let total = cgroup::total_ram_bytes().unwrap_or(0);
+    if total == 0 {
+        return false; // can't reason about proportion — don't pin
+    }
+    let footprint = cgroup::read_cgroup_u64(cgroup_path, "memory.current").unwrap_or(u64::MAX);
+    footprint <= total / 8
+}
+
+/// Pin a cgroup out of swap entirely (`Some(0)`) or hand it back (`None` → "max").
+/// Best-effort: a kernel without swap accounting simply has no such file, and a
+/// missing knob must never take the protector down.
+fn set_swap_max(cgroup_path: &Path, bytes: Option<u64>) {
+    let v = match bytes {
+        Some(b) => b.to_string(),
+        None => "max".to_string(),
+    };
+    let _ = cgroup::write_cgroup(cgroup_path, "memory.swap.max", &v);
+}
+
 fn page_size() -> u64 {
     let ps = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) };
     if ps > 0 { ps as u64 } else { 4096 }
@@ -126,6 +152,36 @@ fn set_protection(cgroup_path: &Path, value: u64) -> Result<()> {
     // so oomd still has other cgroups to pick from if it must act.
     if value > 0 {
         set_oomd_avoid(cgroup_path, true);
+        // Forbid swapping outright. memory.min only stops reclaim from taking a
+        // cgroup BELOW its floor — everything above the floor is still fair game,
+        // so a compositor guaranteed 516MB with a ~1GB working set was measured
+        // half-evicted: 523MB resident against 530MB in swap, with
+        // memory.swap.max sitting wide open at "max". Every window switch then
+        // faults those pages back, and since zram had long since filled (6.5/7.4GB)
+        // they were coming off the on-disk swapfile — which is exactly what "I can
+        // barely switch windows and the keyboard lags" is. vm.swappiness is 180
+        // here (correct when zram is fast and free, ruinous once it's full), so the
+        // kernel pages the desktop out enthusiastically unless told not to.
+        //
+        // Protecting the spine from the OOM killer while letting it swap to disk
+        // protects the wrong thing: it survives, unusably. This is the lever that
+        // makes "resident" actually mean resident.
+        //
+        // Only for the SMALL things, though. set_protection also runs for the
+        // focused app (protect_foreground), and pinning a 4GB browser wholly into
+        // RAM would reserve a quarter of the machine and manufacture the very
+        // pressure we exist to prevent — favouring the foreground must not turn it
+        // into a black hole. The spine and an ordinary terminal are ~0.2-1GB and
+        // fit comfortably; anything larger keeps its swap door open and is welcome
+        // to page out its cold parts.
+        if swap_pin_eligible(cgroup_path) {
+            set_swap_max(cgroup_path, Some(0));
+        } else {
+            set_swap_max(cgroup_path, None);
+        }
+    } else {
+        // Releasing a protection re-opens the swap door.
+        set_swap_max(cgroup_path, None);
     }
     let got = cgroup::read_cgroup_u64(cgroup_path, "memory.min").unwrap_or(0);
     if value == 0 || got >= value {
@@ -182,6 +238,41 @@ const SESSION_BUS_SERVICES: &[&str] = &["dbus.service"];
 /// they're safe targets. (The hogs self-protecting at -1000 is its own problem,
 /// addressed by the explicit kill rung — a SIGKILL ignores oom_score_adj.)
 const OOM_SCORE_ADJ_PROTECT: i32 = -1000;
+
+/// oom_score_adj pushed onto BACKGROUND HOGS so the kernel's *global* OOM killer
+/// picks one of them rather than the session.
+///
+/// Protecting the spine at -1000 is only half the job, and on 2026-07-14 the
+/// missing half cost a whole session. The kernel's global killer ranks by
+/// oom_score_adj, and the heaviest consumers here self-protect: every Claude
+/// session sits at -1000 by its own hand. So when RAM+swap ran out, ~7GB of hogs
+/// were *structurally immune* and the only eligible victims left were the session
+/// itself — session dbus and pipewire at +200, and `systemd --user` at +100.
+/// The kernel dutifully killed the user manager, which IS the logout.
+///
+/// Being merely un-killable is not enough: someone must be *more* killable. This
+/// inverts the ranking so a resumable background session takes the hit instead of
+/// the desktop. Raising a score needs no privilege the daemon lacks, and it
+/// deliberately overrides a hog's own -1000 — self-protection is antisocial when
+/// the alternative victim is the user's whole session. Reset to neutral on
+/// recovery; re-applied every pass while pressure lasts (new forks inherit it).
+const OOM_SCORE_ADJ_HOG: i32 = 500;
+/// The neutral score a hog returns to once pressure clears. Deliberately NOT the
+/// -1000 it set for itself: we do not restore antisocial self-protection, we just
+/// stop actively biasing the kernel toward it.
+const OOM_SCORE_ADJ_NEUTRAL: i32 = 0;
+
+/// Bias the kernel's global OOM killer TOWARD this cgroup — the mirror of
+/// `protect_one`'s -1000. Best-effort per pid; a process that exits mid-walk is
+/// simply skipped.
+pub fn bias_hog_oom(cgroup_path: &Path) {
+    set_oom_score_adj(cgroup_path, OOM_SCORE_ADJ_HOG);
+}
+
+/// Undo `bias_hog_oom` — back to neutral, not to the hog's own -1000.
+pub fn unbias_hog_oom(cgroup_path: &Path) {
+    set_oom_score_adj(cgroup_path, OOM_SCORE_ADJ_NEUTRAL);
+}
 
 /// cpu.weight for the desktop slice (session.slice) — ~10× the app-slice default
 /// so the compositor wins the scheduler over bulk app work under contention.

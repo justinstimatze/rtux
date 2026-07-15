@@ -47,12 +47,16 @@ pub fn cmd_status() -> Result<()> {
 pub fn cmd_ctl(action: &str, id: Option<&str>) -> Result<()> {
     // `history` is a read-only view of the same `list` reply (its `recent`
     // field) — no separate daemon endpoint, so no extra control-socket surface.
-    let read_only = matches!(action, "list" | "history");
-    let req = if read_only {
-        serde_json::json!({ "cmd": "list" })
-    } else {
-        let id = id.context("this action needs an app id (get one from `pressured ctl list`)")?;
-        serde_json::json!({ "cmd": "act", "action": action, "id": id })
+    let req = match action {
+        "list" | "history" => serde_json::json!({ "cmd": "list" }),
+        // Self-only: the daemon marks the CALLER's cgroup live via SO_PEERCRED, so
+        // this deliberately sends no id — there is nothing to address but yourself.
+        "touch" => serde_json::json!({ "cmd": "touch" }),
+        _ => {
+            let id =
+                id.context("this action needs an app id (get one from `pressured ctl list`)")?;
+            serde_json::json!({ "cmd": "act", "action": action, "id": id })
+        }
     };
 
     let mut stream = UnixStream::connect(SOCKET_PATH)

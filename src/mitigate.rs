@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::guard::format_bytes;
-use crate::{actions, cgroup, notify};
+use crate::{actions, cgroup, guard, notify};
 
 /// Summon the HUD to the foreground. Wayland only grants focus to a *fresh*
 /// client, so we SIGKILL any running HUD (instant death frees the D-Bus name
@@ -155,6 +155,12 @@ const MAX_KILLED: usize = 3;
 /// Swap-used fraction at which reclaim-to-zram is futile (nowhere left to move
 /// pages) and we jump straight to the kill rung, even before freezing is spent.
 const SWAP_HIGH_WATER: f64 = 0.85;
+/// Stop forcing memory.reclaim once swap is this full. Above it there is nowhere
+/// left to page to, so a forced reclaim only stalls — and can push the kernel over
+/// the edge into a global OOM (see the reclaim call site). Well below
+/// SWAP_HIGH_WATER on purpose: we want to stop *shoving* long before we conclude
+/// the machine is out of room and reach for the kill rung.
+const SWAP_RECLAIM_CEILING: f64 = 0.70;
 /// Warn (once) when at least this many Claude sessions are running — an early,
 /// gentle nudge to close some before pressure ever forces a freeze or kill.
 const CLAUDE_SESSION_WARN_COUNT: usize = 4;
@@ -180,6 +186,9 @@ pub struct Mitigator {
     /// Background hogs whose cpu.weight we've demoted under CPU pressure —
     /// restored on cpu_recover(). Independent of the memory ladder.
     cpu_throttled: Vec<PathBuf>,
+    /// Hogs whose oom_score_adj we've raised so a global OOM eats them instead of
+    /// the session — returned to neutral on recover().
+    oom_biased: Vec<PathBuf>,
     self_cgroup: Option<PathBuf>,
 }
 
@@ -191,6 +200,7 @@ impl Mitigator {
             killed: Vec::new(),
             advised: false,
             cpu_throttled: Vec::new(),
+            oom_biased: Vec::new(),
             self_cgroup: cgroup::self_cgroup(),
         }
     }
@@ -229,6 +239,38 @@ impl Mitigator {
             let _ = actions::set_cpu_weight(&path, CPU_WEIGHT_NORMAL);
         }
         eprintln!("restored cpu.weight on {} background app(s)", count);
+    }
+
+    /// Bias the kernel's *global* OOM killer toward background hogs and away from
+    /// the session — the defence for the case rtux cannot intercept at all.
+    ///
+    /// rtux can freeze and kill, but a global OOM (`constraint=CONSTRAINT_NONE`)
+    /// fires inside the kernel with no userspace say. The only lever that reaches
+    /// it is oom_score_adj, and by default the ranking here is exactly inverted:
+    /// the fattest consumers (Claude sessions) self-protect at -1000 while the
+    /// session's own services sit at +100/+200. On 2026-07-14 that handed the
+    /// kernel a menu containing only the desktop, and it took `systemd --user` —
+    /// the logout. Raising the hogs gives the killer a resumable victim instead.
+    ///
+    /// Re-applied every pass on purpose: oom_score_adj is per-process and inherited
+    /// at fork, so a long-lived session's new children need it too.
+    pub fn bias_oom_toward_hogs(&mut self) {
+        let candidates = match cgroup::list_freezable_cgroups() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for (path, name, mem) in candidates {
+            if mem < MIN_FREEZE_BYTES {
+                break; // sorted largest-first
+            }
+            if self.denied(&name, &path) {
+                continue;
+            }
+            guard::bias_hog_oom(&path);
+            if !self.oom_biased.iter().any(|p| p == &path) {
+                self.oom_biased.push(path);
+            }
+        }
     }
 
     /// Elevated pressure: gently throttle the largest freezable consumer via
@@ -294,6 +336,15 @@ impl Mitigator {
         if is_foreground_related(path) {
             return true;
         }
+        // …but the check above is blind under tmux: a pane descends from the tmux
+        // server, not from the focused window, so it reported the pane being typed
+        // in as background and we froze it mid-keystroke. A session that says a
+        // human just typed in it is spared on its own word (see ipc::LIVE), which
+        // is the only signal that survives tmux. Bounded by TTL and MAX_LIVE, so
+        // this can never starve the mitigator of candidates.
+        if crate::ipc::touched_recently(path) {
+            return true;
+        }
         false
     }
 
@@ -343,16 +394,45 @@ impl Mitigator {
                         // happen entirely in silence.
                         let before =
                             crate::cgroup::read_cgroup_u64(&p, "memory.current").unwrap_or(0);
-                        let _ = actions::reclaim_cgroup(&p, reclaim_target);
+                        // Only reclaim while swap still has somewhere to put the pages.
+                        //
+                        // memory.reclaim forces the kernel to push this cgroup's anon
+                        // pages out NOW. That is a gift when swap has room and a
+                        // loaded gun when it doesn't: on 2026-07-14 rtux forced a
+                        // 4.5GB reclaim into an already-full swap (zram 6.5/7.4G,
+                        // swapfile 8.8/16G) and the kernel's global OOM killer fired
+                        // in the SAME SECOND, taking systemd --user and the session
+                        // with it. The mitigation caused the outage it existed to
+                        // prevent. Freezing alone (SIGSTOP) already stops the growth,
+                        // which is the part that matters; the reclaim is only ever a
+                        // bonus, so skip it rather than shove against a full swap.
+                        let headroom = cgroup::swap_used_fraction() < SWAP_RECLAIM_CEILING;
+                        if headroom {
+                            let _ = actions::reclaim_cgroup(&p, reclaim_target);
+                        } else {
+                            eprintln!(
+                                "skipped reclaim of {} — swap {:.0}% full, no room to page out",
+                                n,
+                                cgroup::swap_used_fraction() * 100.0
+                            );
+                        }
                         let after = crate::cgroup::read_cgroup_u64(&p, "memory.current")
                             .unwrap_or(before);
                         let reclaimed = before.saturating_sub(after);
                         let significant = reclaimed > 64 * 1024 * 1024;
                         let body = if significant {
+                            // Say "paged out", not "moved to compressed RAM": zram is
+                            // only the FIRST swap device. Once it fills (it was
+                            // 6.5/7.4GB full during the 2026-07-14 outage) everything
+                            // overflows to the on-disk swapfile — so the cheerful
+                            // "compressed RAM" line was describing gigabytes of disk
+                            // writes, which is exactly what stalled the desktop it
+                            // claimed to be protecting. Don't promise a destination we
+                            // haven't checked.
                             format!(
-                                "Froze {} ({}) and moved {} to compressed RAM to keep \
-                                 the desktop responsive. Resumes automatically when \
-                                 pressure clears.",
+                                "Froze {} ({}) and paged out {} to keep the desktop \
+                                 responsive. Resumes automatically when pressure \
+                                 clears.",
                                 n, sz, format_bytes(reclaimed)
                             )
                         } else {
@@ -364,7 +444,7 @@ impl Mitigator {
                         };
                         if significant {
                             crate::events::record(format!(
-                                "Reclaimed {} from {} to compressed RAM",
+                                "Paged out {} from {}",
                                 format_bytes(reclaimed),
                                 n
                             ));
@@ -530,6 +610,13 @@ impl Mitigator {
         // fresh.
         self.killed.clear();
         self.advised = false;
+
+        // Hand the hogs back a neutral OOM score. We do NOT restore the -1000 they
+        // set for themselves — that self-protection is what left the kernel with
+        // only the session to kill.
+        for path in std::mem::take(&mut self.oom_biased) {
+            guard::unbias_hog_oom(&path);
+        }
 
         // Release throttles (memory.high = max). Record it so the trail closes the
         // ledger — an "Eased off X" with no matching release is a half-story.
