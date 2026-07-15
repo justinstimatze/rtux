@@ -52,6 +52,16 @@ pub fn cmd_ctl(action: &str, id: Option<&str>) -> Result<()> {
         // Self-only: the daemon marks the CALLER's cgroup live via SO_PEERCRED, so
         // this deliberately sends no id — there is nothing to address but yourself.
         "touch" => serde_json::json!({ "cmd": "touch" }),
+        // `budget [MB]` — the id slot carries megabytes, not a cgroup. Read-only.
+        "budget" => {
+            let want_mb = match id {
+                Some(s) => Some(s.parse::<u64>().with_context(|| {
+                    format!("`ctl budget` takes megabytes, not {s:?} (e.g. `ctl budget 2048`)")
+                })?),
+                None => None,
+            };
+            serde_json::json!({ "cmd": "budget", "want_mb": want_mb })
+        }
         _ => {
             let id =
                 id.context("this action needs an app id (get one from `pressured ctl list`)")?;
@@ -59,8 +69,20 @@ pub fn cmd_ctl(action: &str, id: Option<&str>) -> Result<()> {
         }
     };
 
-    let mut stream = UnixStream::connect(SOCKET_PATH)
-        .with_context(|| format!("connecting to {} (is the daemon running?)", SOCKET_PATH))?;
+    let mut stream = match UnixStream::connect(SOCKET_PATH) {
+        Ok(s) => s,
+        // A gate must never mistake "I couldn't ask" for "the answer is no". See
+        // render_budget for why this is exit 2 and not an error like everything else.
+        Err(e) if action == "budget" => {
+            eprintln!("? no verdict — cannot reach the daemon at {SOCKET_PATH} ({e})");
+            eprintln!("  This is NOT a refusal. Decide without rtux.");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("connecting to {} (is the daemon running?)", SOCKET_PATH))
+        }
+    };
     writeln!(stream, "{}", req)?;
     let mut resp = String::new();
     stream.read_to_string(&mut resp)?;
@@ -71,9 +93,69 @@ pub fn cmd_ctl(action: &str, id: Option<&str>) -> Result<()> {
         render_hud(&v);
     } else if action == "history" {
         render_history(&v);
+    } else if action == "budget" {
+        return render_budget(&v);
     } else {
         let ok = v["ok"].as_bool().unwrap_or(false);
         println!("{} {}", if ok { "✓" } else { "✗" }, v["msg"].as_str().unwrap_or(""));
+    }
+    Ok(())
+}
+
+/// Render a budget verdict and — the whole point — set the exit code, so a gate
+/// can be `pressured ctl budget 2048 || refuse` with no JSON parsing at all.
+///
+///   0 = admitted (ok or tight)
+///   1 = refused (full)
+///   2 = NO VERDICT — the daemon couldn't be reached, is too old to know `budget`,
+///       or answered something unparseable.
+///
+/// 2 exists because "I have no answer" and "the answer is no" are different claims
+/// and must not share an exit code. The first draft of this function did share one:
+/// it defaulted a missing `verdict` field to "full", so an older daemon replying
+/// `{"ok":false,"msg":"bad request"}` rendered as a confident red refusal with an
+/// empty reason. A gate wired to that would have refused all work whenever the
+/// daemon was stale — and blamed memory pressure for it. This is the same failure
+/// mode as the display-string gate and the stale journal (see DESIGN.md): a broken
+/// tool handing back a confident verdict. Fail loud, never fail decisive.
+///
+/// "tight" admits on purpose: this is a guard rail, not a nanny, and a gate that
+/// refuses at the first hint of scarcity gets turned off within a day — at which
+/// point it guards nothing. Callers wanting the finer distinction read `verdict`
+/// off the socket directly.
+fn render_budget(v: &serde_json::Value) -> Result<()> {
+    let answered = v["ok"].as_bool().unwrap_or(false);
+    match v["verdict"].as_str() {
+        Some(_) if answered => {}
+        _ => {
+            let msg = v["msg"].as_str().unwrap_or("no verdict field in the reply");
+            eprintln!("? no verdict — the daemon did not answer the budget question ({msg})");
+            eprintln!("  Most likely it predates `ctl budget`; try `sudo ./install.sh`.");
+            eprintln!("  This is NOT a refusal. Decide without rtux.");
+            std::process::exit(2);
+        }
+    }
+    let verdict = v["verdict"].as_str().unwrap_or("full");
+    let reason = v["reason"].as_str().unwrap_or("");
+    let (mark, colour) = match verdict {
+        "ok" => ("✓", "\x1b[32m"),
+        "tight" => ("~", "\x1b[33m"),
+        _ => ("✗", "\x1b[31m"),
+    };
+    println!("{colour}{mark} {verdict}\x1b[0m — {reason}");
+
+    let mb = |k: &str| v[k].as_u64().map(|b| b / (1024 * 1024));
+    if let (Some(cur), Some(head)) = (mb("app_current_bytes"), mb("headroom_bytes")) {
+        let ceiling = mb("ceiling_bytes").map(|c| format!("{c}M")).unwrap_or_else(|| "unset".into());
+        println!(
+            "  apps {cur}M of {ceiling} ceiling · {head}M headroom · {}M free · PSI {:.1}",
+            mb("mem_available_bytes").unwrap_or(0),
+            v["psi_some_avg10"].as_f64().unwrap_or(0.0)
+        );
+    }
+
+    if verdict == "full" {
+        std::process::exit(1);
     }
     Ok(())
 }
