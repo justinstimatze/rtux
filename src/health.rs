@@ -41,18 +41,36 @@ const CAP: usize = 60;
 
 /// Spine faults in one tick above which we write an incident line to the journal.
 ///
-/// This threshold is a GUESS and is marked as one deliberately. What we know: the
-/// spine idles at exactly 0 faults/s on this machine, so any sustained nonzero is
-/// already abnormal, and 1-2 is plausibly just a service touching a cold page of
-/// its own binary. What we do not know is where "noticeable" starts, because the
-/// only incident we have was never instrumented — which is the whole reason this
-/// module exists.
+/// **Derived from measurement, not picked.** The first version of this constant was
+/// 20, reasoned from "the spine idles at 0, so any sustained nonzero is abnormal".
+/// It cried wolf within six minutes of shipping — `SPINE HURT: 20 major faults` on
+/// an idle desktop at PSI 0.1 with nobody waiting on anything. A black box that
+/// records non-incidents is worthless in the exact way everything else in this
+/// project has been worthless: a confident instrument reporting something untrue.
 ///
-/// 20/s is picked to be quiet at idle and to fire well before a stall of the kind
-/// that started this project. Once a real incident is captured, replace this with
-/// the measured number and delete this paragraph. Do not tune it against a healthy
-/// machine — that is guessing, and guessing is what this module is here to end.
-const INCIDENT_FAULTS_PER_TICK: u64 = 20;
+/// The error was reasoning about *fault counts* when the thing that matters is
+/// *how long the user waits*. So measure what a fault costs. Two independent
+/// events on this machine, different subsystems, different days, different page
+/// sets:
+///
+///     wake-from-lock   38,836 faults /  40.0s = 1.03 ms/fault
+///     cold ollama embed 56,625 faults / 112.8s = 1.99 ms/fault
+///
+/// They agree within ~2x, which is what licenses using them to size a threshold.
+/// (Both are 10-20x slower than this box's NVMe spec of ~0.1ms and I do NOT know
+/// why — candidates are a 96%-full LVM root, swapfile fragmentation, or the
+/// zram/disk split. The agreement is the load-bearing part; the absolute value is
+/// empirical and unexplained. Do not present the ms/fault figure as understood.)
+///
+/// At 1-2 ms/fault, ~100 faults in one second is ~100-200ms of the interactive
+/// path sitting on disk — the rough floor of human perception, and the point where
+/// "the machine feels slow" starts being true rather than theoretical. The 40s wake
+/// ran at ~950 faults/s and would fire loudly; the idle 20/s that cried wolf is
+/// ~20-40ms and correctly says nothing.
+///
+/// Re-derive this if the swap device changes. It is a wall-clock claim wearing a
+/// fault-count costume, and the costume only fits this machine.
+const INCIDENT_FAULTS_PER_TICK: u64 = 100;
 
 /// One tick of spine harm.
 #[derive(Clone, Debug, PartialEq)]
@@ -268,11 +286,43 @@ mod tests {
         assert_eq!(peak, Some(7));
     }
 
+    /// The threshold is a wall-clock claim in a fault-count costume. These pin the
+    /// two measurements it is derived from, so a future edit has to argue with the
+    /// data rather than with a number that looks arbitrary.
+    ///
+    /// Both events measured on rukh, 2026-07-15.
     #[test]
-    fn the_idle_spine_is_below_the_incident_threshold() {
-        // Measured 2026-07-15: gnome-shell and IBus both at 0 faults/min at idle.
-        // If this ever fires, either the machine changed or the threshold is wrong.
-        assert!(0 < INCIDENT_FAULTS_PER_TICK);
-        assert!(2 < INCIDENT_FAULTS_PER_TICK, "a cold binary page must not be an incident");
+    fn the_threshold_is_about_a_hundred_milliseconds_of_waiting() {
+        // Independent events, different subsystems, agreeing within ~2x.
+        let wake_ms_per_fault: f64 = 40_000.0 / 38_836.0; // 1.03
+        let embed_ms_per_fault: f64 = 112_806.0 / 56_625.0; // 1.99
+        assert!(
+            (wake_ms_per_fault - embed_ms_per_fault).abs() < 1.5,
+            "the two measurements must agree, or the threshold has no basis"
+        );
+
+        // At those costs the threshold lands near the floor of human perception.
+        let cheapest = INCIDENT_FAULTS_PER_TICK as f64 * wake_ms_per_fault;
+        let dearest = INCIDENT_FAULTS_PER_TICK as f64 * embed_ms_per_fault;
+        assert!(cheapest >= 80.0, "firing below ~100ms of wait is crying wolf: {cheapest}ms");
+        assert!(dearest <= 300.0, "waiting past ~300ms to speak up is too quiet: {dearest}ms");
+    }
+
+    /// The regression that motivated the derivation: the shipped threshold of 20
+    /// fired on an idle desktop within six minutes, on ~20-40ms of wait.
+    #[test]
+    fn the_idle_spike_that_cried_wolf_no_longer_fires() {
+        let observed_idle_spike = 20;
+        assert!(
+            observed_idle_spike < INCIDENT_FAULTS_PER_TICK,
+            "20 faults/s is ~20-40ms of wait — below perception, and it must not be an incident"
+        );
+    }
+
+    /// ...and the real one still does, loudly.
+    #[test]
+    fn the_forty_second_wake_would_have_been_captured() {
+        let wake_faults_per_sec = 38_836 / 40;
+        assert!(wake_faults_per_sec > INCIDENT_FAULTS_PER_TICK, "the black box must catch THIS");
     }
 }
