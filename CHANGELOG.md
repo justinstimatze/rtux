@@ -50,6 +50,36 @@ the unused portion costs nothing.
   green "clean" — a blind meter posing as a healthy one, which is the same defect
   as the display-string gate and `render_budget`'s missing-verdict default.
 
+  **The threshold is derived, after the first one cried wolf.** It shipped at 20
+  faults/tick, reasoned from "the spine idles at 0, so any sustained nonzero is
+  abnormal", and fired within six minutes of install on an idle desktop at PSI 0.1
+  with nobody waiting. The error was reasoning about fault *counts* when the thing
+  that matters is *how long the user waits*. Two independent events on this machine
+  give the missing constant:
+
+      wake-from-lock     38,836 faults /  40.0s = 1.03 ms/fault
+      cold ollama embed  56,625 faults / 112.8s = 1.99 ms/fault
+
+  They agree within ~2x across different subsystems and page sets, which is what
+  licenses using them. At 1–2 ms/fault, **100 faults/tick ≈ 100–200ms of the
+  interactive path on disk** — roughly the floor of perception. The 40s wake ran at
+  ~950/s and fires loudly; the idle 20/s correctly says nothing. (Both figures are
+  10–20x this box's NVMe spec and that gap is unexplained — the *agreement* is the
+  load-bearing part, not the absolute value. Do not present ms/fault as understood.)
+
+### Fixed — the journal is a black box, so it has to stay readable
+
+Measured six minutes after a restart: 138 lines, of which 36 were three fault-in
+messages repeating every 30s and 12 were the bulk ceiling re-announcing an unchanged
+number. A real `SPINE HURT:` line was in there, drowning.
+
+The rule now encoded in `once_per`: **an event is logged every time; a standing
+condition is logged once.** "Faulted in 64MB" is an event. "This cgroup's swap is
+shmem and unreachable" was already true last pass and will be true next pass —
+re-stating it every 30s is not reporting, it is noise that buries reporting. Same
+reasoning `announced` already applied to protection. Failures stay loud on every
+pass: unlike a success, a failure is not a settled fact.
+
 ### Note — the app.slice ceiling is validated
 
 22h of evidence: spine at 0 major faults/min, app.slice at 1,491/min (the design

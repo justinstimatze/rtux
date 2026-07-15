@@ -100,6 +100,30 @@ fn apply() {
 /// this, so we align our targets to it — otherwise the read-back verification in
 /// set_protection reads a value a few KB below what we asked for and every
 /// protection falsely reports failure.
+/// True the FIRST time it is called with a given key, false forever after.
+///
+/// The journal is a black box, and a black box has to be readable to be worth
+/// keeping. Measured 2026-07-15, six minutes after a restart: 138 lines from this
+/// daemon, of which 36 were three fault-in lines repeating every 30s and 12 were
+/// the bulk ceiling re-announcing an unchanged number. A real `SPINE HURT:` line
+/// was in there, drowning.
+///
+/// The rule this encodes: **an event is logged every time; a standing condition is
+/// logged once.** "We faulted in 64MB" is an event. "This cgroup's swap is shmem
+/// and unreachable" is a condition — it was already true on the last pass, it will
+/// be true on the next, and re-stating it every 30s is not reporting, it is noise
+/// that buries reporting. Same reasoning as `announced` in main.rs, which already
+/// does this for protection: re-asserting is cheap and must stay silent.
+///
+/// Deliberately has no reset. These conditions are stable for the daemon's life,
+/// and a "log again if it changes" rule would flap on the shmem that breathes
+/// between 0.4 and 4.3GB — re-creating the spam it exists to prevent.
+fn once_per(key: &str) -> bool {
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    let Ok(mut seen) = SEEN.lock() else { return false };
+    seen.insert(key.to_string())
+}
+
 /// Is this cgroup small enough to hold wholly in RAM? Pinning something out of
 /// swap reserves its entire footprint, so the lever only makes sense for things
 /// whose whole point is instant response and whose size is bounded: the session
@@ -383,7 +407,7 @@ fn fault_in_swapped(cgroup_path: &Path) -> u64 {
             format_bytes(before),
             format_bytes(after)
         );
-    } else if unreadable > 0 {
+    } else if unreadable > 0 && once_per(&format!("unreadable:{leaf}")) {
         // Pages were demonstrably out and we could not read them. This one IS a
         // defect — most likely a missing CAP_SYS_PTRACE.
         eprintln!(
@@ -391,7 +415,7 @@ fn fault_in_swapped(cgroup_path: &Path) -> u64 {
              {unreadable}/{pids} pid(s) — check CAP_SYS_PTRACE",
             format_bytes(before)
         );
-    } else {
+    } else if unreadable == 0 && once_per(&format!("unreachable:{leaf}")) {
         // Expected, not broken. Every pid's page table is clean: pagemap found no
         // swap PTE anywhere, so there is no address whose touch would pull anything
         // back. That is the signature of shmem swap (tmpfs / wl_shm / dma-buf) —
@@ -878,11 +902,21 @@ fn set_bulk_ceiling(compositor_path: &Path) {
     let Ok(total_ram) = cgroup::total_ram_bytes() else { return };
     let high = app_slice_high(total_ram);
     match crate::actions::cap_cgroup(&app_slice, high) {
-        Ok(()) => eprintln!(
-            "bulk ceiling: apps capped at {} resident ({} reserved for desktop + kernel)",
-            format_bytes(high),
-            format_bytes(total_ram.saturating_sub(high))
-        ),
+        // Announce the ceiling, not the heartbeat. This is re-asserted every 30s
+        // by design (a re-login builds a new app.slice), but the *value* is a
+        // standing fact — it only ever changes if RAM does. Logging it each pass
+        // put 12 identical lines into every 6 minutes of journal.
+        Ok(()) => {
+            if once_per(&format!("ceiling:{}:{high}", app_slice.display())) {
+                eprintln!(
+                    "bulk ceiling: apps capped at {} resident ({} reserved for desktop + kernel)",
+                    format_bytes(high),
+                    format_bytes(total_ram.saturating_sub(high))
+                );
+            }
+        }
+        // Failures stay loud on every pass: unlike the success, a failure is not a
+        // settled fact — it is a thing that is still wrong right now.
         Err(e) => eprintln!("  note: could not set app.slice memory.high ({e})"),
     }
 }
