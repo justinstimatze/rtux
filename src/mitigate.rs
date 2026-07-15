@@ -155,6 +155,13 @@ const MAX_KILLED: usize = 3;
 /// Swap-used fraction at which reclaim-to-zram is futile (nowhere left to move
 /// pages) and we jump straight to the kill rung, even before freezing is spent.
 const SWAP_HIGH_WATER: f64 = 0.85;
+/// No single background cgroup may hold more than 1/N of RAM resident once we're
+/// throttling it. An absolute, machine-relative ceiling — the whole point is that
+/// it does NOT scale with the target's appetite (see the throttle call site).
+const BULK_RESIDENT_DIVISOR: u64 = 4;
+/// Never throttle below this, however over-budget a hog is — a cap this tight is
+/// already deep reclaim, and going lower just thrashes it to no benefit.
+const MIN_THROTTLE_FLOOR: u64 = 256 * 1024 * 1024;
 /// Stop forcing memory.reclaim once swap is this full. Above it there is nowhere
 /// left to page to, so a forced reclaim only stalls — and can push the kernel over
 /// the edge into a global OOM (see the reclaim call site). Well below
@@ -164,16 +171,6 @@ const SWAP_RECLAIM_CEILING: f64 = 0.70;
 /// Warn (once) when at least this many Claude sessions are running — an early,
 /// gentle nudge to close some before pressure ever forces a freeze or kill.
 const CLAUDE_SESSION_WARN_COUNT: usize = 4;
-/// cpu.weight a background hog is demoted to under CPU contention (vs the 100
-/// default and the foreground's 1000). Low enough to cede the cores to the
-/// desktop + focused app; still non-zero so it isn't fully starved.
-const CPU_WEIGHT_THROTTLED: u32 = 10;
-/// The default cpu.weight a demoted hog is restored to when CPU pressure clears.
-const CPU_WEIGHT_NORMAL: u32 = 100;
-/// Skip demoting cgroups smaller than this (avoid churn on trivial ones). Most
-/// sustained CPU hogs — compiles, node, browsers — are well above it.
-const CPU_THROTTLE_FLOOR: u64 = 64 * 1024 * 1024; // 64 MB
-
 pub struct Mitigator {
     frozen: Vec<(PathBuf, String)>,
     throttled: Vec<(PathBuf, String)>,
@@ -183,9 +180,6 @@ pub struct Mitigator {
     killed: Vec<PathBuf>,
     /// Debounce for the "too many Claude sessions" advisory.
     advised: bool,
-    /// Background hogs whose cpu.weight we've demoted under CPU pressure —
-    /// restored on cpu_recover(). Independent of the memory ladder.
-    cpu_throttled: Vec<PathBuf>,
     /// Hogs whose oom_score_adj we've raised so a global OOM eats them instead of
     /// the session — returned to neutral on recover().
     oom_biased: Vec<PathBuf>,
@@ -199,46 +193,9 @@ impl Mitigator {
             throttled: Vec::new(),
             killed: Vec::new(),
             advised: false,
-            cpu_throttled: Vec::new(),
             oom_biased: Vec::new(),
             self_cgroup: cgroup::self_cgroup(),
         }
-    }
-
-    /// CPU pressure: demote *background* hogs' cpu.weight so the desktop and the
-    /// focused app keep the cores. cpu.weight is work-conserving, so this is a
-    /// no-op for idle background cgroups and only bites the ones actually burning
-    /// CPU — which is why we can blanket-demote without sampling who's hot. The
-    /// foreground and the hard-exempt spine are spared by denied(). Reversible.
-    pub fn cpu_throttle(&mut self) {
-        let candidates = match cgroup::list_freezable_cgroups() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        for (path, name, mem) in candidates {
-            if mem < CPU_THROTTLE_FLOOR {
-                break; // sorted largest-first
-            }
-            if self.denied(&name, &path) || self.cpu_throttled.iter().any(|p| p == &path) {
-                continue;
-            }
-            cgroup::ensure_cpu_controller(&path);
-            if actions::set_cpu_weight(&path, CPU_WEIGHT_THROTTLED).is_ok() {
-                self.cpu_throttled.push(path);
-            }
-        }
-    }
-
-    /// CPU pressure cleared: restore every background hog we demoted.
-    pub fn cpu_recover(&mut self) {
-        if self.cpu_throttled.is_empty() {
-            return;
-        }
-        let count = self.cpu_throttled.len();
-        for path in std::mem::take(&mut self.cpu_throttled) {
-            let _ = actions::set_cpu_weight(&path, CPU_WEIGHT_NORMAL);
-        }
-        eprintln!("restored cpu.weight on {} background app(s)", count);
     }
 
     /// Bias the kernel's *global* OOM killer toward background hogs and away from
@@ -296,8 +253,29 @@ impl Mitigator {
             {
                 continue;
             }
-            // Squeeze to 90% of current: reclaim a slice without heavy stalling.
-            let high = (mem / 10 * 9).max(256 * 1024 * 1024);
+            // Clamp to what the MACHINE can hold — never to 90% of the hog's own
+            // appetite.
+            //
+            // `mem / 10 * 9` is relative to the target, so the cap scales WITH the
+            // thing it is supposed to restrain: the bigger a runaway grows, the
+            // bigger an allowance it earns. On 2026-07-14 that produced the log
+            // line "throttled claude · madrid to 20.2GB" — on a 14.8GB machine.
+            // A memory.high above physical RAM is a no-op the daemon recorded as a
+            // successful intervention, and the session died 50 minutes later.
+            //
+            // memory.high is the right lever (the kernel's own docs call it "the
+            // main mechanism to control memory usage": it throttles allocation into
+            // direct reclaim and never invokes the OOM killer, so an over-eager cap
+            // costs the hog latency, not its life). It was only ever pointed at the
+            // wrong number. Take the tighter of "back off a little" and "fit in the
+            // machine", so a hog can be squeezed gently but can never negotiate
+            // itself a ceiling the box cannot honour.
+            let machine_cap = cgroup::total_ram_bytes()
+                .map(|t| t / BULK_RESIDENT_DIVISOR)
+                .unwrap_or(u64::MAX);
+            let high = (mem / 10 * 9)
+                .min(machine_cap)
+                .max(MIN_THROTTLE_FLOOR);
             match actions::cap_cgroup(&path, high) {
                 Ok(_) => {
                     let disp = display_name(&path, &name);
