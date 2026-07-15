@@ -316,47 +316,108 @@ able to masquerade as an incident for an afternoon.
 ## Levers not yet pulled
 
 Ranked by how much of "things chug to a halt all the goddamn time" each one
-actually removes. Recorded 2026-07-14, after the realignment.
+actually removes. Recorded 2026-07-14, after the realignment; **re-ranked
+2026-07-15 against 22h of evidence, which moved #3 to the top and demoted #1.**
 
-1. **Admission control — half built, deliberately stopped.** Everything else rtux
-   does is post-hoc: pressure arrives, we react. The prior art is unanimous that the
-   guarantee never comes from clever scheduling — it comes from *refusing work that
-   doesn't fit*. (`advise_claude_sessions` is **not** this: it notifies after the
-   sessions are already running, and can be ignored.)
+**What the first full day of the ceiling actually said.** Measured 22h in, at idle:
 
-   The primitive exists: **`ctl budget [MB]`** answers "can this machine afford N
-   more right now?" and exits 0/1/2. It can only exist because the `app.slice`
-   ceiling is a standing partition — headroom under it is a real number rather than
-   a vibe. Without a ceiling there is no denominator and the only honest answer is
-   "try it and find out", which is the reactive posture the ceiling replaced.
+    spine (gnome-shell, IBus)      0 major faults/min   <-- the guarantee, holding
+    app.slice                  1,491 major faults/min   <-- the design, working
+    memory PSI some avg10           0.00%
+    halts since the ceiling             none
 
-   **Nothing calls it, on purpose.** The obvious caller — a PreToolUse gate on
-   agent fan-out — was measured before building and turns out to gate a non-cost:
-   subagents are extra contexts inside one existing process, not new processes, so
-   a fan-out adds no cgroup and no GB. Estimate high and such a gate denies
-   everything; estimate honestly and it never fires. Either way it is theatre.
+The ceiling was the fix. The spine is resident and the apps are swapped, which is
+the architecture doing exactly what it says. **rtux is currently meeting its
+promise** — a first, and the reason the ranking below changed.
 
-   The measured arithmetic is different, and it moved the target. A Claude session
-   costs ~1GB **only while active**; idle ones sit swapped and cost nearly nothing
-   (observed: 7 sessions, 4.2GB resident against an 11.4GB ceiling, PSI 0.0). So the
-   halt is a *concurrency* problem — how many sessions are busy at once — not a
-   count problem, and count-based admission control doesn't touch it.
+The catch, and the reason the instrument came first: *cumulative* `pgmajfault` on
+gnome-shell reads **182,714**, and that number is a scar from the 2026-07-14
+incident, not a wound. The counter is monotonic; it can never go down no matter
+how healthy the machine gets. Reading that total as harm — which is exactly what
+happened while collecting this data, before the rate was measured — is the same
+error as the display-string gate: a confident instrument reporting something that
+stopped being true. **The metric is d/dt, and a total is never a health signal.**
 
-   Stopped here for evidence rather than guessing a third time (2026-07-14). The
-   ceiling is hours old and the halt has not recurred since; if it doesn't, the
-   ceiling was the fix and any gate would be dead code. If it does, the recurrence
-   says what to gate on. Wiring a caller before then would repeat the day's actual
-   lesson — building on an unmeasured premise — with more ceremony.
+1. ~~Admission control~~ **→ demoted. The evidence gate resolved: no.** The primitive
+   (`ctl budget`) ships and works, and the plan of record was to wire a caller only
+   if the halt recurred with the ceiling in place. It has not recurred in 22h, and
+   the spine is at 0 faults/min. Per the gate's own terms, **the ceiling was the fix
+   and a gate would be dead code.** Leave `ctl budget` unwired; it costs nothing
+   sitting there and is ready if a future incident names something to gate on.
+   Details of why the obvious caller was theatre are kept below, because the
+   reasoning is the reusable part.
 
-2. **Nothing protects the terminal the user is typing into.** The rule is: mouse,
-   typing, sound, WM, drawing — protected hard. But *typing* includes the window
-   the typing lands in, and that window sits in `app.slice`, under the ceiling,
-   expendable (measured: 30,900 major faults in the user's terminal). The spine
-   protects the input *method* and then hands the keystroke to an unprotected app.
-   Focus-following (attention-following, above) is the missing half of "protect
-   typing" — the focused window is part of the interactive path *while focused*.
+2. **The guarantee is invisible** — *now built (2026-07-15), see `health.rs`.* The
+   spine's major-fault rate is sampled every tick, surfaced in the HUD as three
+   honest states (resident / waiting-on-disk / **unknown**), and written to the
+   journal as `SPINE HURT:` when a tick crosses the threshold. That last part is
+   the point: the standing plan is *learn from the next halt*, and until now nothing
+   would have recorded it. An evidence gate with no instrument behind it is a wish.
 
-3. **The guarantee is invisible.** See "Measure harm, not swap" above.
+   The threshold (20 faults/tick) is a **guess, marked as one in the source.** The
+   spine idles at 0, so the shape is right; where "noticeable" starts is unknown
+   because the only incident we have was never instrumented. Replace it with the
+   measured number after the first capture — and do not tune it against a healthy
+   machine, which is guessing wearing a lab coat.
+
+3. **Nothing protects the terminal the user is typing into** — the next real build.
+   Now measurable: with the fault-rate meter live, focus-following can be judged by
+   whether the focused window's fault rate actually drops, rather than by whether
+   the idea sounds right. Every previous lever was argued; this one can be tested.
+
+4. **`system.slice` is outside the pen.** The partition is spine-vs-`app.slice`, but
+   there is a third territory neither pinned nor capped. Measured 2026-07-15:
+   `ollama.service` has `memory.high = max`, sits at 280MB resident with 559MB
+   swapped, and takes **59 major faults/min while idle** — steady disk I/O for a
+   model nobody is using. It is not spine (nothing breaks if it's slow) and not
+   `app.slice` (so the ceiling never reaches it); `docker.service` and
+   `containerd.service` are in the same position. The harm is small today and the
+   hole is not: nothing bounds what a background service loads. **Do not just cap
+   `system.slice`** — it holds spine members too (the system bus). It needs the same
+   membership rule applied honestly, which is a real piece of design, not a knob.
+
+---
+
+*Retained reasoning from the 2026-07-14 ranking, since the arithmetic is the
+reusable part:*
+
+**Admission control — the primitive, and why nothing calls it.** Everything else rtux
+does is post-hoc: pressure arrives, we react. The prior art is unanimous that the
+guarantee never comes from clever scheduling — it comes from *refusing work that
+doesn't fit*. (`advise_claude_sessions` is **not** this: it notifies after the
+sessions are already running, and can be ignored.)
+
+The primitive exists: **`ctl budget [MB]`** answers "can this machine afford N
+more right now?" and exits 0/1/2. It can only exist because the `app.slice`
+ceiling is a standing partition — headroom under it is a real number rather than
+a vibe. Without a ceiling there is no denominator and the only honest answer is
+"try it and find out", which is the reactive posture the ceiling replaced.
+
+**Nothing calls it, on purpose.** The obvious caller — a PreToolUse gate on
+agent fan-out — was measured before building and turns out to gate a non-cost:
+subagents are extra contexts inside one existing process, not new processes, so
+a fan-out adds no cgroup and no GB. Estimate high and such a gate denies
+everything; estimate honestly and it never fires. Either way it is theatre.
+
+The measured arithmetic is different, and it moved the target. A Claude session
+costs ~1GB **only while active**; idle ones sit swapped and cost nearly nothing
+(observed: 7 sessions, 4.2GB resident against an 11.4GB ceiling, PSI 0.0). So the
+halt is a *concurrency* problem — how many sessions are busy at once — not a
+count problem, and count-based admission control doesn't touch it.
+
+Stopped here for evidence rather than guessing a third time (2026-07-14). **That
+gate has since resolved (2026-07-15): 22h, no recurrence, spine at 0 faults/min
+— so the ceiling was the fix and the caller stays unbuilt.** Wiring one anyway
+would repeat the day's actual lesson — building on an unmeasured premise — with
+more ceremony.
+
+**Nothing protects the terminal the user is typing into.** The rule is: mouse,
+typing, sound, WM, drawing — protected hard. But *typing* includes the window
+the typing lands in, and that window sits in `app.slice`, under the ceiling,
+expendable (measured: 30,900 major faults in the user's terminal). The spine
+protects the input *method* and then hands the keystroke to an unprotected app.
+Focus-following (attention-following, above) is the missing half of "protect
+typing" — the focused window is part of the interactive path *while focused*.
 
 ## Status
 

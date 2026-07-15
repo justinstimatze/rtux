@@ -517,8 +517,15 @@ struct SpineClass {
     /// Substrings matched against unit cgroup names. EVERY match is protected,
     /// so a substring may deliberately span several units.
     units: &'static [&'static str],
-    /// The memory.min budget each matching cgroup gets, as a fn of total RAM.
-    budget: fn(u64) -> u64,
+    /// The memory.min budget each matching cgroup gets, given total RAM and that
+    /// cgroup's own path.
+    ///
+    /// Takes the path so a budget can *measure its subject* rather than assert a
+    /// percentage of RAM at it — see compositor_memory_min, where a guessed 3%
+    /// aimed the desktop's only real guarantee at a third of its actual working
+    /// set and cost a 40s wake. Evaluated per cgroup, not once per class, because
+    /// a class can span units of very different sizes.
+    budget: fn(u64, &Path) -> u64,
 }
 
 /// The interactive spine, in full.
@@ -595,6 +602,27 @@ const SPINE: &[SpineClass] = &[
         budget: spine_memory_min,
     },
 ];
+
+/// Every live spine cgroup, labelled with its class name.
+///
+/// Reads the same `SPINE` table `protect_critical_services` protects from, on
+/// purpose: an instrument that enumerates the spine independently would drift
+/// from the set actually being protected, and then report health for a spine
+/// nobody is guarding — or miss a class someone added to SPINE and forgot to add
+/// here. One table, both callers.
+///
+/// Best-effort per class: a class matching nothing is skipped rather than failing
+/// the whole enumeration (fcitx isn't installed here, and that's not an error).
+pub fn spine_cgroups() -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    for class in SPINE {
+        let Ok(paths) = cgroup::find_all_cgroups_for_service(class.units) else { continue };
+        for p in paths {
+            out.push((class.name.to_string(), p));
+        }
+    }
+    out
+}
 
 /// oom_score_adj we bias the session spine to: -1000, the maximum protection.
 ///
@@ -709,37 +737,112 @@ pub struct ProtectionReport {
     pub failed: Vec<(&'static str, String)>,
 }
 
-/// Calculate memory.min for the compositor based on hardware heuristics.
-/// Uses a percentage of total RAM with floor/ceiling:
-///   - 3% of total RAM
-///   - minimum 256MB
-///   - maximum 1GB
-fn compositor_memory_min(total_ram: u64) -> u64 {
-    let three_pct = total_ram / 33; // ~3%
-    let min = 256 * 1024 * 1024; // 256MB
-    let max = 1024 * 1024 * 1024; // 1GB
-    three_pct.clamp(min, max)
+/// memory.min for the compositor — **measured, not guessed.**
+///
+/// This is the most load-bearing number in rtux: it decides whether the desktop
+/// stays resident. It used to be `total_ram / 33` — 3% of RAM, capped at 1GB, a
+/// bare percentage with no measurement behind it and a doc comment calling it
+/// "hardware heuristics". Measured on this machine 2026-07-15, minutes after the
+/// user waited ~40 seconds at a login field on wake-from-lock:
+///
+///     memory.min      460MB   <-- what that 3% promised the compositor
+///     memory.current  781MB
+///     memory.swap     538MB   <-- evicted anyway
+///
+/// **`memory.min` was not violated — it was obeyed exactly.** It guaranteed 460MB,
+/// the kernel honoured 460MB, and then reclaimed the 538MB sitting above the line,
+/// because everything above the line is by definition fair game. The wake had to
+/// fault 38,836 pages back off the swapfile one at a time; that is the 40 seconds.
+/// The floor was simply set to a third of the thing it was protecting. A guarantee
+/// aimed below its target is not a weak guarantee, it is a decoration.
+///
+/// So ask the compositor how big it is.
+///
+/// # Why `current + swap` and never `current`
+///
+/// The sum is **invariant to how much has already been evicted**, which is exactly
+/// the property a floor needs:
+///
+///     fully resident:  current=1320  swap=  0  -> 1320
+///     squeezed:        current= 781  swap=538  -> 1319
+///
+/// Reading `current` alone would ratchet the floor DOWN every time the compositor
+/// got squeezed — the floor would chase the eviction it exists to prevent, and a
+/// compositor that lost pages once could never earn them back. Same trap as the
+/// cumulative-fault scar in health.rs: read the wrong quantity and the instrument
+/// confirms whatever already happened.
+///
+/// # Why a cap, and why this cap
+///
+/// This follows a live number, so a leaking or ballooning compositor must not be
+/// able to pin the machine — `memory.min` is unreclaimable by construction, and
+/// enough of it turns a reclaim into an OOM. The cap is **half the desktop
+/// reserve**: the compositor may claim at most half of what is already set aside
+/// for spine + kernel + page cache, leaving the other half for everyone else in
+/// it. Tied to `desktop_reserve` on purpose so the two cannot drift apart.
+///
+/// Note this costs nothing when unused. `memory.min` is a protection, not an
+/// allocation: it caps how much of what the cgroup *actually holds* is shielded
+/// from reclaim. Setting it generously is cheap; setting it stingily is what cost
+/// 40 seconds.
+fn compositor_memory_min(total_ram: u64, cgroup_path: &Path) -> u64 {
+    let current = cgroup::read_cgroup_u64(cgroup_path, "memory.current").unwrap_or(0);
+    let swapped = cgroup::read_cgroup_u64(cgroup_path, "memory.swap.current").unwrap_or(0);
+    compositor_min_for(total_ram, current.saturating_add(swapped))
+}
+
+/// The sizing decision itself, split out from the cgroup reads so it can be
+/// tested — the same split as `budget_verdict`. The old version of this number
+/// was a pure function of RAM and still wrong; being testable is not the same as
+/// being right, so the tests below pin the *measured* machine, not the arithmetic.
+fn compositor_min_for(total_ram: u64, working_set: u64) -> u64 {
+    let floor = 512 * 1024 * 1024;
+    let cap = (desktop_reserve(total_ram) / 2).max(floor);
+    match working_set {
+        // Unreadable, or a cgroup that exists but isn't filled yet (it appears
+        // before the compositor has started). Both mean "no measurement", and a
+        // measurement of zero must never be read as a compositor that needs
+        // nothing — that would write the floor and quietly re-create the bug this
+        // function exists to fix. Take the cap until there is something to
+        // measure; the 30s re-assert corrects it as soon as there is.
+        0 => cap,
+        ws => ws.clamp(floor, cap),
+    }
 }
 
 /// Calculate memory.min for audio services.
 /// Smaller budget: 1% of RAM, floor 64MB, ceiling 256MB.
-fn audio_memory_min(total_ram: u64) -> u64 {
+///
+/// Still a percentage rather than a measurement, unlike the compositor above, and
+/// that is a deliberate scope line rather than an oversight: audio is single-digit
+/// MB per unit and sits far below this floor, so the guess is never the binding
+/// constraint. Revisit if a measurement ever shows one of these units near its cap.
+fn audio_memory_min(total_ram: u64, _cgroup_path: &Path) -> u64 {
     let one_pct = total_ram / 100;
     let min = 64 * 1024 * 1024; // 64MB
     let max = 256 * 1024 * 1024; // 256MB
     one_pct.clamp(min, max)
 }
 
-/// The standing ceiling on what ALL apps may collectively hold resident:
-/// everything except a reserve kept for the spine, the kernel, and page cache.
+/// What is held back from the apps for the desktop: the spine, the kernel, and
+/// enough page cache that the desktop isn't re-reading its own binaries off disk.
 ///
-/// Reserve is a quarter of RAM, clamped to [2GB, 4GB] — enough for the spine
-/// (~1.3GB here) plus room for the kernel and enough page cache that the desktop
-/// isn't re-reading its own binaries off disk, without handing a large machine a
-/// pointlessly large idle reserve.
+/// A quarter of RAM, clamped to [2GB, 4GB] — ~3.7GB here, against a spine that
+/// actually holds ~1.3GB — without handing a large machine a pointlessly large
+/// idle reserve.
+///
+/// Factored out because two separate decisions must agree on it: the app ceiling
+/// below, and the compositor's memory.min cap. They are the two halves of one
+/// partition — what apps may take, and what the desktop may keep — and if they
+/// drifted apart the spine could be promised more than was ever reserved for it.
+fn desktop_reserve(total_ram: u64) -> u64 {
+    (total_ram / 4).clamp(2 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024)
+}
+
+/// The standing ceiling on what ALL apps may collectively hold resident:
+/// everything except the desktop reserve.
 fn app_slice_high(total_ram: u64) -> u64 {
-    let reserve = (total_ram / 4).clamp(2 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024);
-    total_ram.saturating_sub(reserve)
+    total_ram.saturating_sub(desktop_reserve(total_ram))
 }
 
 /// Put a standing ceiling on bulk app memory. Written ONCE at startup — not in
@@ -967,7 +1070,7 @@ pub fn protect_critical_services() -> Result<ProtectionReport> {
     // protected. The compositor is the load-bearing one for responsiveness;
     // never let audio's fate mask it.
     for class in SPINE {
-        protect_one(class.name, class.units, (class.budget)(total_ram), &mut report);
+        protect_one(class.name, class.units, class.budget, total_ram, &mut report);
     }
 
     // Standing config, applied once the compositor gives us the session layout.
@@ -990,7 +1093,13 @@ pub fn protect_critical_services() -> Result<ProtectionReport> {
 /// `report.protected`; on any failure it lands in `report.failed` with a reason
 /// — nothing is logged here (this runs on a 30s retry, so the *caller* decides
 /// when to log, to avoid spamming the journal every cycle).
-fn protect_one(name: &'static str, services: &[&str], mem_min: u64, report: &mut ProtectionReport) {
+fn protect_one(
+    name: &'static str,
+    services: &[&str],
+    budget: fn(u64, &Path) -> u64,
+    total_ram: u64,
+    report: &mut ProtectionReport,
+) {
     // EVERY matching cgroup, not just the first. A category can span several units
     // and the first match is not a representative of the rest: "pipewire" matches
     // pipewire-pulse.service AND pipewire.service, and protecting only the former
@@ -1007,6 +1116,10 @@ fn protect_one(name: &'static str, services: &[&str], mem_min: u64, report: &mut
         return;
     }
     for path in paths {
+        // Per cgroup, not once per class: a measuring budget must see its own
+        // subject, and hoisting this out of the loop would size every unit in a
+        // class from whichever one happened to be enumerated first.
+        let mem_min = budget(total_ram, &path);
         match set_protection(&path, mem_min) {
             Ok(()) => {
                 // memory.min + oomd_avoid fend off reclaim and systemd-oomd, but
@@ -1037,7 +1150,14 @@ fn protect_one(name: &'static str, services: &[&str], mem_min: u64, report: &mut
 /// Session-spine services (the message bus) are small; a modest floor keeps their
 /// working set resident under reclaim. Their real protection is oom_score_adj —
 /// this just stops routine paging from touching them. ~0.5% of RAM, 32–128MB.
-fn spine_memory_min(total_ram: u64) -> u64 {
+///
+/// A percentage rather than a measurement, deliberately: measured 2026-07-15,
+/// every unit in these classes sits at single-digit MB with 0 swapped, i.e. two
+/// orders below this floor, so the guess is nowhere near binding. The compositor
+/// is the one whose real working set overran its guess, and it is the one that got
+/// a measuring budget. Give another class one if a measurement — not an intuition
+/// — ever shows it pressed against this cap.
+fn spine_memory_min(total_ram: u64, _cgroup_path: &Path) -> u64 {
     (total_ram / 200).clamp(32 * 1024 * 1024, 128 * 1024 * 1024)
 }
 
@@ -1166,11 +1286,69 @@ mod tests {
 
 #[cfg(test)]
 mod budget_tests {
-    use super::{budget_verdict, BUDGET_DENY_ABOVE_PSI};
+    use super::{
+        app_slice_high, budget_verdict, compositor_min_for, desktop_reserve, BUDGET_DENY_ABOVE_PSI,
+    };
     const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+    /// rukh, where every number in these tests was measured.
+    const THIS_MACHINE: u64 = 15_569_156 * 1024;
 
     fn verdict(headroom: u64, psi: f64, want: Option<u64>) -> &'static str {
         budget_verdict(headroom, Some(11 * GB), 5 * GB, psi, want).0
+    }
+
+    /// The regression, as a test. On 2026-07-15 the compositor's floor was 460MB
+    /// (`total_ram / 33`) against a measured working set of ~1.32GB; the kernel
+    /// obeyed the 460MB exactly, evicted the 538MB above it, and the next
+    /// wake-from-lock cost 38,836 major faults and ~40 seconds of the user's life.
+    #[test]
+    fn the_floor_covers_the_compositor_that_cost_forty_seconds() {
+        let measured_working_set = 781 * MB + 538 * MB; // current + swap, as read
+        let got = compositor_min_for(THIS_MACHINE, measured_working_set);
+        assert_eq!(got, measured_working_set, "the floor must cover the whole working set");
+        assert!(got > 460 * MB, "must beat the guess that caused the incident");
+        // And the old formula, pinned here so nobody reintroduces it by feel.
+        assert!(THIS_MACHINE / 33 < measured_working_set, "3% was always below the target");
+    }
+
+    /// The property that makes `current + swap` the right quantity: a squeezed
+    /// compositor and a resident one must size the SAME. Reading `current` alone
+    /// would ratchet the floor down as pages were evicted — the floor chasing the
+    /// eviction it exists to prevent, so a compositor that lost pages once could
+    /// never earn them back.
+    #[test]
+    fn a_squeezed_compositor_sizes_the_same_as_a_resident_one() {
+        let resident = compositor_min_for(THIS_MACHINE, 1319 * MB + 0);
+        let squeezed = compositor_min_for(THIS_MACHINE, 781 * MB + 538 * MB);
+        assert_eq!(resident, squeezed);
+    }
+
+    /// The floor follows a live number, so it must not follow one off a cliff.
+    #[test]
+    fn a_ballooning_compositor_cannot_pin_the_machine() {
+        let cap = desktop_reserve(THIS_MACHINE) / 2;
+        assert_eq!(compositor_min_for(THIS_MACHINE, 12 * GB), cap);
+        // memory.min is unreclaimable, so the cap must leave the rest of the
+        // reserve (kernel, page cache, the other spine classes) intact.
+        assert!(cap < desktop_reserve(THIS_MACHINE));
+        assert!(cap + app_slice_high(THIS_MACHINE) < THIS_MACHINE);
+    }
+
+    /// Zero is "I could not measure", never "it needs nothing" — the failure that
+    /// would silently rebuild the original bug.
+    #[test]
+    fn an_unmeasurable_compositor_gets_the_cap_not_the_floor() {
+        let got = compositor_min_for(THIS_MACHINE, 0);
+        assert_eq!(got, desktop_reserve(THIS_MACHINE) / 2);
+        assert!(got > 512 * MB, "an unread measurement must never render as the floor");
+    }
+
+    /// A tiny compositor still gets a real floor rather than its idle footprint,
+    /// so it has somewhere to grow into before the next re-assert sees it.
+    #[test]
+    fn a_barely_started_compositor_still_gets_the_floor() {
+        assert_eq!(compositor_min_for(THIS_MACHINE, 40 * MB), 512 * MB);
     }
 
     #[test]

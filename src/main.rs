@@ -3,6 +3,7 @@ mod cgroup;
 mod cli;
 mod events;
 mod guard;
+mod health;
 mod ipc;
 mod mitigate;
 mod notify;
@@ -148,6 +149,9 @@ fn run_daemon() -> Result<()> {
     println!("pressured: monitoring PSI (poll 1s, Ctrl+C to stop)...");
     let mut notifier = notify::Notifier::new();
     let mut mitigator = mitigate::Mitigator::new();
+    // The instrument. Constructed here so its first tick seeds counters rather
+    // than reporting every spine cgroup's lifetime total as one second of harm.
+    let mut meter = health::FaultMeter::new();
     let poll_interval = Duration::from_secs(1);
     let mut ticks: u64 = 0;
     let mut normal_streak: u32 = 0;
@@ -166,7 +170,20 @@ fn run_daemon() -> Result<()> {
         // idempotent and cheap; `announced` keeps the journal quiet.
         if ticks % 30 == 0 {
             protect_and_report(false, &mut announced);
+            // Re-enumerate on the same cadence and for the same reason: a re-login
+            // builds a new session tree, and a meter holding the dead session's
+            // paths would report a flatlined-because-gone spine as a healthy one.
+            meter.refresh_spine();
         }
+
+        // Sample the spine's fault rate BEFORE reading PSI and deciding what to
+        // do. This is the outcome metric — whether the interactive path is waiting
+        // on disk right now — and it is measured unconditionally, at every
+        // pressure level, because the harm we care about does not announce itself
+        // via PSI first. The 19s stall ran at cpu PSI 2.28 and memory PSI that no
+        // threshold here would have called critical; what it did have was the
+        // input method faulting on every keypress. That is what this counts.
+        meter.tick();
 
         let mem_psi = match psi::read_psi("/proc/pressure/memory") {
             Ok(r) => r,

@@ -72,6 +72,19 @@ struct ListReply {
     recent: Vec<RecentEvent>,
     /// Rolling PSI some.avg10 history (oldest-first) for the HUD sparkline.
     pressure_trend: Vec<f64>,
+    /// Spine major faults in the last tick — is the interactive path waiting on
+    /// disk *right now*. None when the meter read no spine cgroup at all, which
+    /// means "unknown", NOT "zero" (see health::Sample::observed).
+    spine_faults_now: Option<u64>,
+    /// Worst tick in the last ~minute. Carried separately because a stall is over
+    /// long before anyone opens the HUD, so the instantaneous value alone would
+    /// report every past incident as "clean".
+    spine_faults_peak: Option<u64>,
+    /// Which spine class hurt most in the last tick, if any did.
+    spine_worst: Option<String>,
+    /// How many spine cgroups the last tick actually read. Zero is the alarm: it
+    /// means rtux is guarding a spine it cannot find.
+    spine_observed: usize,
 }
 
 /// (used, total) for RAM and swap, from /proc/meminfo (bytes).
@@ -265,6 +278,7 @@ fn build_list() -> ListReply {
         .into_iter()
         .map(|(ago_secs, text)| RecentEvent { ago_secs, text })
         .collect();
+    let latest = crate::health::latest();
     ListReply {
         ok: true,
         some_avg10,
@@ -276,6 +290,10 @@ fn build_list() -> ListReply {
         apps,
         recent,
         pressure_trend: crate::trend::history(),
+        spine_faults_now: (latest.observed > 0).then_some(latest.faults),
+        spine_faults_peak: crate::health::peak(),
+        spine_worst: latest.worst.map(|(name, _)| name),
+        spine_observed: latest.observed,
     }
 }
 
