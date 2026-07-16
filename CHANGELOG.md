@@ -5,6 +5,54 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Fixed — notifications, silently denied by AppArmor since the daemon was hardened
+
+rtux froze five apps during the 2026-07-15 incident and told the user about none of
+them. Only the journal knew. Silent intervention is the legibility thesis inverted:
+the machine reaching into your session without saying so is exactly the "opaque
+automation" failure DESIGN.md defines rtux *against*.
+
+The kernel's own account:
+
+    apparmor="DENIED" operation="connect" info="Failed name lookup - disconnected path"
+    error=-13 profile="notify-send" name="run/user/1000/bus" fsuid=1000 ouid=1000
+
+Read `name="run/user/1000/bus"` — **no leading slash.** Ubuntu ships an AppArmor
+profile for notify-send permitting `/run/user/*/bus`. `ProtectSystem=full` makes
+systemd build the daemon a mount namespace; inside one, AppArmor cannot resolve that
+path back to the root namespace, calls it "disconnected", and hands the matcher a
+*relative* name the profile's absolute rule cannot match. Denied → EACCES →
+"Could not connect: Permission denied", which reads exactly like a file-permission
+problem and is nothing of the kind.
+
+Everything you would suspect first is innocent, and each was measured to be: the
+socket is `srw-rw-rw-`; `setuid(1000)` succeeds; `/run/user/1000` (dev 0:113,
+mode=700 uid=1000) IS in the daemon's namespace per `/proc/PID/mountinfo`;
+`MemoryMax` and seccomp are uninvolved. `ProtectSystem` looked guilty only because
+the first bisect dropped directives from a set where it was the **only** one that
+creates a mount namespace — `PrivateTmp` and `ProtectHome=read-only` fail
+identically. The namespace is the cause; ProtectSystem was a proxy for it.
+
+**Fixed by speaking D-Bus directly through `gdbus`, at zero cost to hardening.**
+AppArmor attaches profiles on `exec`; the daemon is `unconfined`, and of the
+binaries that reach the bus only notify-send carries a profile — gdbus, dbus-send
+and busctl do not. Verified under the unit's *full* confinement: notify-send FAILS,
+gdbus WORKS, zero denials. The alternative was deleting `ProtectSystem=full` from a
+root daemon that writes cgroups and other processes' `oom_score_adj` — trading real
+hardening to avoid understanding a bug.
+
+`notify-send --wait` did the action-button waiting for us; D-Bus makes that manual,
+so the click now arrives as an `ActionInvoked` signal watched via `dbus-monitor`.
+The monitor starts **before** the notification is sent: the signal is broadcast
+once, and a click landing between send and watch would be lost, leaving a button
+that does nothing — worse than no button, since the machine looks broken rather than
+quiet. Parser tested against verbatim bus output from a real click, including the
+bus's own NameAcquired/NameLost lines (bare `string` bodies with no uint32) that
+turned up in the capture and were not predicted.
+
+New runtime deps: `libglib2.0-bin` (gdbus), `dbus-bin` (dbus-monitor). `install.sh`
+warns rather than fails if absent — the journal record survives either way.
+
 ### Fixed — the compositor's floor was set to a third of the compositor
 
 `compositor_memory_min` was `total_ram / 33` — 3% of RAM, capped at 1GB, a bare
