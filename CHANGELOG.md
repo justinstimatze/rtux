@@ -36,22 +36,43 @@ A refusal names what to close. The first draft filtered on the list reply's
 `freezable` flag and named the wrong things — Firefox (1.3GB) and Ollama (274MB)
 while 7.4GB of Claude sessions went unmentioned. See the known issue below.
 
-### Known issue — `ctl list` reports terminals as unfreezable; the daemon freezes them
+### Fixed — the HUD said your sessions were protected while the daemon froze them
 
-Two notions wearing one name. The list reply computes
-`freezable = has_freeze && !never_freeze(..)`, and `never_freeze` excludes
-TERMINAL_NAMES ("tmux", "vte-spawn", …) — so every Claude session in a tmux-spawn
-scope reports `freezable: false` and the HUD tags it `critical`, which reads as
-"protected". The daemon's freeze path uses `denied()`, which checks only
-`hard_exempt`, and freezes those sessions happily. Measured: `Froze claude · rtux
-(1.6GB)` against a list reply calling that exact scope unfreezable.
+Two notions wearing one name. The list reply computed
+`freezable = has_freeze && !never_freeze(..)` — but `never_freeze` answers *"may a
+CLIENT freeze this via ctl?"* and deliberately refuses every terminal (its own doc:
+"the conservative default for user-initiated actions"). The auto-mitigator asks a
+different question, answered in `denied()`, which checks only `hard_exempt` plus the
+dynamic foreground/live spares.
 
-The daemon's behaviour is the correct one per DESIGN ("apps within those terminals
-are expendable"); protecting the terminal you are actually *in* is already handled
-dynamically by `is_foreground_related` + the LIVE/touch set. The blanket
-TERMINAL_NAMES exclusion is a cruder, stale version of that, and the display is what
-is wrong. Not fixed here — changing the flag changes the HUD's `critical` tag
-broadly, which deserves its own change.
+So every Claude session in a `tmux-spawn` scope reported `freezable: false` and the
+HUD tagged it `critical` — reading as "rtux will never touch this" — while the
+daemon froze those same sessions under pressure. Measured 2026-07-15: `Froze
+claude · rtux (1.6GB)` against a list reply calling that exact scope unfreezable.
+The `◀ hog` marker had the same defect from the same cause: it flagged Firefox
+(1.2GB) as the next thing to be paused while `claude · lexicon` (2.0GB) sat labelled
+`critical` — and lexicon is what actually got frozen. Its comment even stated the
+intent the code violated ("so the top-consumer marker never promises a pause that
+won't come").
+
+The daemon's behaviour is correct per DESIGN (apps within terminals are expendable,
+and the terminal you're actually *in* is spared dynamically). The display was the
+wrong half. Both fields now use the mitigator's own predicate.
+
+**`spared` is now a separate fact from `freezable`,** because they are different
+promises and collapsing them is what let the bug read as "protected forever":
+
+- `critical` — rtux will *never* pause this (structural: the spine, the system).
+- `spared` — rtux may pause this, but not while you're using it (momentary:
+  foreground, or a recent keystroke).
+- `live` / `◀ hog` — rtux may pause this, and the hog is next.
+
+Also pinned by test: **never pass a display label to `hard_exempt`/`never_freeze`.**
+They match by substring against a list containing the protector's own names, so
+"claude · rtux" — the label for a session working on this repo — contains "rtux" and
+hard-exempts itself; a directory named `dbus`, `systemd` or `pressured` would do the
+same. Not a live bug (both callers pass `cgroup_to_app_name`'s output), but an
+earlier draft of the test tripped it, and it fails silently.
 
 ### Fixed — notifications, silently denied by AppArmor since the daemon was hardened
 

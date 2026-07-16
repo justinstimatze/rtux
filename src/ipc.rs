@@ -50,6 +50,10 @@ struct App {
     frozen: bool,
     protected: bool,
     freezable: bool,
+    /// Spared from an automatic pause *right now* because the user is using it
+    /// (foreground, or a recent keystroke). Momentary — distinct from `freezable`,
+    /// which is about structural eligibility and does not change minute to minute.
+    spared: bool,
     flagged: Option<String>,
 }
 
@@ -226,21 +230,45 @@ fn build_list() -> ListReply {
     };
     let raw_apps = cgroup::list_apps(LIST_MIN_BYTES);
 
-    // Flag the largest consumer rtux would *actually* pause first — same floor
-    // the mitigator uses, so the top-consumer marker never promises a pause that won't come.
+    // Flag the largest consumer rtux would *actually* pause first — same floor AND
+    // the same predicate the mitigator uses, so the top-consumer marker never
+    // promises a pause that won't come, nor stays silent about one that will.
+    //
+    // This used `never_freeze`, which is the wrong question. `never_freeze` answers
+    // "may a CLIENT freeze this via ctl?" and deliberately refuses every terminal
+    // (see its doc comment: "the conservative default for user-initiated actions").
+    // The auto-mitigator asks a different question and answers it in `denied`, which
+    // checks only `hard_exempt` plus the dynamic foreground/live spares. Measured
+    // 2026-07-15: the HUD marked Firefox (1.2GB) as the top consumer while
+    // claude · lexicon (2.0GB) sat tagged `critical` — and rtux froze lexicon.
     let top = raw_apps
         .iter()
         .find(|a| {
             a.has_freeze
                 && a.mem >= mitigate::MIN_FREEZE_BYTES
-                && !mitigate::never_freeze(&a.name, &a.raw)
+                && !mitigate::hard_exempt(&a.name, &a.raw)
+                && !mitigate::spared_now(&a.path)
         })
         .map(|a| a.path.clone());
 
     let apps = raw_apps
         .into_iter()
         .map(|a| {
-            let freezable = a.has_freeze && !mitigate::never_freeze(&a.name, &a.raw);
+            // "Would the auto-mitigator pause this under pressure?" — which is what
+            // a HUD reader is asking, and what rtux's legibility promise is about.
+            // NOT `never_freeze`: that answers "may a client freeze this via ctl?"
+            // and refuses every terminal, so every Claude session in a tmux-spawn
+            // scope reported false and the HUD tagged it `critical`, which reads as
+            // "protected". The daemon froze those same sessions all along (measured:
+            // "Froze claude · rtux (1.6GB)" against a reply calling that exact scope
+            // unfreezable). A display that contradicts the daemon is the same defect
+            // as the display-string gate and the cumulative-fault scar.
+            let freezable = a.has_freeze && !mitigate::hard_exempt(&a.name, &a.raw);
+            // Whether it is spared *at this moment* is a separate fact from whether
+            // it is eligible at all, and collapsing the two is how the original bug
+            // read as "protected" forever. Carried so the HUD can say "not right
+            // now, you're using it" rather than "never".
+            let spared = mitigate::spared_now(&a.path);
             let id = a
                 .path
                 .strip_prefix(CGROUP_BASE)
@@ -268,6 +296,7 @@ fn build_list() -> ListReply {
                 frozen: a.frozen,
                 protected: a.mem_min > 0,
                 freezable,
+                spared,
                 flagged,
             }
         })

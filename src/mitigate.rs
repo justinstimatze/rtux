@@ -61,6 +61,19 @@ pub fn never_freeze(name: &str, raw_dir_name: &str) -> bool {
     hard_exempt(name, raw_dir_name) || matches_any(name, raw_dir_name, TERMINAL_NAMES)
 }
 
+/// True if the auto-mitigator would spare this cgroup **right now** because the
+/// user is demonstrably using it: it's the foreground window (or descends from
+/// it), or it reported a keystroke recently (see ipc::LIVE).
+///
+/// Dynamic and momentary, unlike `hard_exempt` — this same cgroup is a legitimate
+/// target thirty seconds after you stop typing in it, which is the entire point.
+/// Exposed so the HUD can say *why* something won't be paused instead of implying
+/// it can never be. `denied` remains the authority; this is the subset of it that
+/// is about attention rather than about structure.
+pub fn spared_now(path: &Path) -> bool {
+    is_foreground_related(path) || crate::ipc::touched_recently(path)
+}
+
 /// True if `path` is the foreground window's cgroup, or hosts any process that
 /// descends from the foreground window's pid — i.e. the terminal the user is in
 /// and all of its tabs. Such cgroups are spared from automatic freeze/kill so we
@@ -118,6 +131,80 @@ fn display_name(path: &Path, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The display bug, pinned. `never_freeze` and `hard_exempt` answer different
+    /// questions, and the list reply asked the wrong one — so every Claude session
+    /// in a tmux-spawn scope reported unfreezable and the HUD tagged it `critical`,
+    /// which reads as "protected", while the daemon froze it under pressure
+    /// (measured 2026-07-15: "Froze claude · rtux (1.6GB)").
+    ///
+    /// Real scope names from rukh. `name` is what `cgroup_to_app_name` yields for a
+    /// terminal child scope — which is what BOTH callers actually pass. Not the
+    /// "claude · rtux" display label: see the collision test below for why that
+    /// distinction is load-bearing rather than pedantic.
+    #[test]
+    fn a_background_claude_session_is_freezable_even_though_a_client_may_not_freeze_it() {
+        let raw = "tmux-spawn-0b244635-6078-4edf-8f7d-3075ad3fd91f.scope";
+        let name = "Terminal (child)";
+        // What the auto-mitigator asks — and it WILL pause this under pressure.
+        assert!(!hard_exempt(name, raw), "the daemon freezes background sessions; say so");
+        // What a CLIENT may do — deliberately conservative, and correctly unchanged.
+        assert!(never_freeze(name, raw), "ctl freeze on a terminal stays refused");
+    }
+
+    /// vte-spawn scopes (a plain gnome-terminal tab) behave the same way.
+    #[test]
+    fn a_vte_terminal_scope_is_also_freezable_by_the_daemon() {
+        let raw = "vte-spawn-89fbb249-eb90-4ee7-b2bc-000000000000.scope";
+        assert!(!hard_exempt("Terminal (child)", raw));
+        assert!(never_freeze("Terminal (child)", raw));
+    }
+
+    /// **Never pass a display label to these predicates.** They match by SUBSTRING
+    /// against a list that includes the protector's own names, so the pretty label
+    /// for a session working on this very repo — "claude · rtux" — contains "rtux"
+    /// and hard-exempts itself. A user whose directory is named `dbus`, `systemd`,
+    /// `pressured` or `rtux` would silently become unfreezable, and the mitigator
+    /// would skip the biggest hog on the box while reporting itself healthy.
+    ///
+    /// Not a live bug: both callers pass `cgroup_to_app_name`'s output ("Terminal
+    /// (child)"), and the display label is computed afterwards, for humans only.
+    /// This test exists because an earlier draft of the test above passed the label
+    /// and failed — the trap is one keystroke away and completely silent.
+    #[test]
+    fn a_display_label_must_never_reach_these_predicates() {
+        let raw = "tmux-spawn-0b244635-6078-4edf-8f7d-3075ad3fd91f.scope";
+        assert!(
+            hard_exempt("claude · rtux", raw),
+            "if this ever stops matching, the collision is gone and this test can go"
+        );
+        assert!(hard_exempt("claude · pressured", raw));
+        // ...whereas the name the code really passes is safe.
+        assert!(!hard_exempt("Terminal (child)", raw));
+    }
+
+    /// The spine must read as `critical` under BOTH predicates — the fix must not
+    /// have widened what the mitigator will touch.
+    #[test]
+    fn the_spine_stays_hard_exempt_under_the_new_predicate() {
+        for (name, raw) in [
+            ("org.gnome.Shell", "org.gnome.Shell@ubuntu.service"),
+            ("pipewire", "pipewire.service"),
+            ("wireplumber", "wireplumber.service"),
+            ("dbus", "dbus.service"),
+        ] {
+            assert!(hard_exempt(name, raw), "{name} must never be auto-frozen");
+            assert!(never_freeze(name, raw), "{name} must never be client-frozen");
+        }
+    }
+
+    /// Firefox is an ordinary app under both — no terminal name to match.
+    #[test]
+    fn an_ordinary_app_was_never_affected_by_the_bug() {
+        let raw = "snap.firefox.firefox-247a1653-e08f-4045-9845-9cc6ac38b2f6.scope";
+        assert!(!hard_exempt("Firefox", raw));
+        assert!(!never_freeze("Firefox", raw));
+    }
 
     #[test]
     fn victim_ranking_prefers_non_claude_then_largest_first() {

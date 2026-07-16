@@ -382,6 +382,13 @@ fn render_hud(v: &serde_json::Value) {
     for a in v["apps"].as_array().unwrap_or(&empty) {
         let mut tags = Vec::new();
         if a["frozen"].as_bool().unwrap_or(false) { tags.push("PAUSED"); }
+        // "spared" and "critical" are different promises and must not share a tag.
+        // spared = rtux may pause this, but not while you're using it (momentary).
+        // critical = rtux will never pause this (structural: the spine, the system).
+        // Collapsing them is the bug this fixed: every tmux-scoped Claude session
+        // rendered as `critical` — reading as "protected forever" — while the daemon
+        // froze it under pressure. Say which promise is being made.
+        if a["spared"].as_bool().unwrap_or(false) { tags.push("spared"); }
         if a["protected"].as_bool().unwrap_or(false) { tags.push("pinned"); }
         if a["flagged"].as_str() == Some("top_consumer") { tags.push("◀ hog"); }
         if !a["freezable"].as_bool().unwrap_or(false) && tags.is_empty() { tags.push("critical"); }
