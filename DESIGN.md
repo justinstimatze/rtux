@@ -313,6 +313,49 @@ pgmajfault **rate** belongs in the HUD — it is the only honest way to see whet
 the guarantee is holding, and its absence is why a benign cache statistic was
 able to masquerade as an incident for an afternoon.
 
+## The recurring bug: a confident claim computed from the wrong thing
+
+Six times in two days, in six different subsystems, one bug. It is worth naming as a
+rule rather than as six postmortems, because it will happen a seventh time.
+
+**Every claim rtux makes — a HUD tag, a log line, a gate's verdict, a metric — must
+be computed from the same predicate, at the same moment, as the behaviour it
+describes. Where it cannot be, it must be able to say "I don't know."**
+
+The roster, so the shape is unmistakable:
+
+| the claim | computed from | the behaviour it described |
+|---|---|---|
+| "compositor is CPU-boosted" | `name == "compositor"` | a `name` that had become a display string |
+| "the spine is protected" (script) | the whole journal | a *previous* run's verdict |
+| `✗ full` (`ctl budget`) | a missing `verdict` field | a daemon too old to know the question |
+| "the compositor is hurting" | `pgmajfault` **total** | a rate that was 0; the total was a scar |
+| "Spine: resident — clean" | a sum over **zero** cgroups | a meter that found no spine to read |
+| `critical` (HUD, i.e. protected) | `never_freeze` (client permission) | `denied()`, which freezes it anyway |
+
+Two corollaries earn their keep:
+
+- **An empty set sums to zero, and zero renders green.** Every signal needs an
+  explicit "I couldn't look" state, distinct from "nothing is wrong". `ctl budget`
+  exits **2** for no-verdict rather than folding it into refusal; `health::Sample`
+  carries `observed` so a blind meter can't pose as a healthy one; `admit` **fails
+  open**, because "I could not ask" is not "the answer is no".
+- **Never dispatch on a string built for humans.** Display labels drift, get
+  prettified, and collide — `hard_exempt` matches by substring against a list ending
+  in `"rtux"`, so the label `claude · rtux` hard-exempts itself. Dispatch on a stable
+  `class` field; keep the pretty name for humans and test that the literal exists.
+
+**The tell is always the same: the failure is silent and the tool is confident.** A
+`find` that matches nothing looks identical to a compositor that isn't running. An
+unreachable daemon looks identical to a full machine. A scar looks identical to a
+wound. None of these printed an error; every one of them printed an answer. So the
+question to ask of any new signal is not "is it right?" but **"what does it say when
+it's broken, and can I tell that apart from good news?"**
+
+Corollary for reviewers: a comment stating the intent is not the intent. The
+top-consumer marker's own comment read *"so the top-consumer marker never promises a
+pause that won't come"* directly above the line that broke that promise.
+
 ## Levers not yet pulled
 
 Ranked by how much of "things chug to a halt all the goddamn time" each one
