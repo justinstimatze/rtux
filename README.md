@@ -161,10 +161,19 @@ is left installed — remove it with your package manager if you wish.)
 
 The full intervention has been observed in the wild: under genuine memory
 pressure, rtux paused a 1.1 GB browser, held the desktop perfectly responsive, and
-reported itself — unprompted, and entirely unbothered. What remains on the horizon
-— following your gaze to warm up the app you're about to reach for; letting a
-frozen window visibly *frost over* in the corner of your eye rather than send a
-note — is chronicled in [DESIGN.md](DESIGN.md).
+reported itself — unprompted, and entirely unbothered. The thing that draws your
+screen now has a floor it can stand on and a pulse you can read, so you can tell at
+a glance whether it is resting easy or straining.
+
+There is a subtler lesson the clearing taught, too. On a hard day rtux paused every
+heavy thing at once — correctly, by its own rules — and the desktop still felt slow,
+because the heavy things *were* the seven windows the human was working in. Pausing
+your own hands is its own kind of slowness. The reversible pause is the right tool
+for a runaway stranger; it is a blunt one for your own open work, and teaching rtux
+that difference — to refuse a load that won't fit before it arrives, and to keep the
+window you're actually looking at warm while it thins the rest — is the work ahead.
+That, along with following your gaze and letting a frozen window visibly *frost
+over* rather than send a note, is chronicled in [DESIGN.md](DESIGN.md).
 
 *The human returns to their work. The machine hums along. All is well in the
 clearing — for now.*

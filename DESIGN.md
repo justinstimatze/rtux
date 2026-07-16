@@ -358,106 +358,118 @@ pause that won't come"* directly above the line that broke that promise.
 
 ## Levers not yet pulled
 
-Ranked by how much of "things chug to a halt all the goddamn time" each one
-actually removes. Recorded 2026-07-14, after the realignment; **re-ranked
-2026-07-15 against 22h of evidence, which moved #3 to the top and demoted #1.**
+Ranked by how much of the *felt* gap each one closes — the distance between "rtux
+reacted correctly" and "the machine felt powerful," which the 21:31 incident proved
+are different things. Recorded 2026-07-14; re-ranked 2026-07-15 against 22h of
+evidence; **re-ranked again 2026-07-16 after v0.3.0, which shipped the old top two
+(admission control and the vital sign) and so collapsed the list upward. A new item
+enters at the top — bounding a single session's growth — because it is the one thing
+the two July incidents named and nothing yet touches.**
 
-**What the first full day of the ceiling actually said.** Measured 22h in, at idle:
+**Why the ranking axis changed.** The earlier lists ranked by "how much of the halts
+each removes." But 21:31 showed rtux can remove the halt — spine at 0 faults/s, ladder
+fired, everything thawed in 24s — and the machine can still feel terrible, because the
+apps it froze were the user's seven working sessions. So the axis is no longer "does
+rtux react well" (it does) but "does the machine feel powerful *while* rtux reacts."
+
+**What the first full day of the ceiling said, and still says.** Measured 22h in, idle:
 
     spine (gnome-shell, IBus)      0 major faults/min   <-- the guarantee, holding
     app.slice                  1,491 major faults/min   <-- the design, working
     memory PSI some avg10           0.00%
     halts since the ceiling             none
 
-The ceiling was the fix. The spine is resident and the apps are swapped, which is
-the architecture doing exactly what it says. **rtux is currently meeting its
-promise** — a first, and the reason the ranking below changed.
+The ceiling was the fix for the *spine* guarantee. The spine is resident and the apps
+are swapped, which is the architecture doing exactly what it says. The half it does
+not touch is the one below.
 
-The catch, and the reason the instrument came first: *cumulative* `pgmajfault` on
-gnome-shell reads **182,714**, and that number is a scar from the 2026-07-14
-incident, not a wound. The counter is monotonic; it can never go down no matter
-how healthy the machine gets. Reading that total as harm — which is exactly what
-happened while collecting this data, before the rate was measured — is the same
-error as the display-string gate: a confident instrument reporting something that
-stopped being true. **The metric is d/dt, and a total is never a health signal.**
+The catch, and the reason the instrument came before any of this: *cumulative*
+`pgmajfault` on gnome-shell reads **182,714**, a scar from the 2026-07-14 incident,
+not a wound. The counter is monotonic; it never goes down however healthy the machine
+gets. Reading that total as harm — which is exactly what happened while collecting
+this data, before the rate was measured — is the same error as the display-string
+gate: a confident instrument reporting something that stopped being true. **The metric
+is d/dt, and a total is never a health signal.**
 
-1. **Admission control — BUILT (`pressured admit`), because the evidence arrived.**
-   Twice on 2026-07-15 this was demoted as "the ceiling was the fix, a gate would be
-   dead code" — and then the halt recurred twice in one day and named its own cause:
+1. **Bound what one session can grow into — the gap admission control does *not*
+   close.** This is the newly-named top item, and the two incidents name it directly:
 
        11:57  Froze claude · lexicon (10.2GB)   <- ONE session, 90% of an 11.4GB ceiling
        21:31  7 Claude sessions are using 10.8GB — froze Firefox + 4 sessions in 30s
 
-   Neither is what was guessed. It is not a *count* problem (the morning's theory)
-   and not a *concurrency* problem either (the afternoon's). Nothing bounds what the
-   sessions collectively hold, and the ceiling only converts that into throttling
-   and freezing after the fact.
+   The morning event was a *single* session at 10.2GB. `pressured admit` (shipped,
+   below) gates the doorway — it can refuse launch #8 — but nothing bounds what an
+   already-admitted session then consumes, and a gate at the door does nothing about
+   a session that walks in small and grows. This is the harder, truer problem, and it
+   is what makes "apps expendable" actually hurt: the expendable app is your work.
+   A per-workload cap (`memory.high` on individual app scopes, sized against the
+   ceiling) is the shape of the answer, but the hard part is *which* scopes and *how
+   much* without turning the ceiling's honest denominator back into a vibe. Design,
+   not a knob. Unlisted before 2026-07-16 because the evidence to name it only just
+   arrived.
 
-   The second incident is the instructive one, because rtux did everything right and
-   the machine still felt terrible. The spine held (0 major faults/s throughout — the
-   compositor and input method never touched disk), the ladder fired correctly, and
-   everything thawed 24s later. And the user's report was "the system still seemed
-   pretty unresponsive," because **every app they were looking at was paused.** That
-   is the architecture's own thesis biting: "spine pinned, apps expendable" is true
-   right up until the apps are your seven working sessions. Freezing them IS the
-   unresponsiveness. Reacting well is not the same as not needing to react.
+2. **Prove focus-following actually spares the window you're in — measure before you
+   build.** Half-built already: `spared_now` = foreground OR recently-typed-in, so the
+   mitigator is *supposed* to skip the session you're looking at. The fault-rate meter
+   now makes the claim testable, which it never was before. The open question is
+   empirical: at 21:31, did the ladder spare the foreground session or freeze it with
+   the other four? If it spared it, the felt gap is narrower than it seemed and this
+   item is nearly done; if it froze it, `spared_now` has a hole and this is the fix.
+   Either way the next move is a *measurement*, not more code — every previous lever
+   here was argued into existence; this one can finally be checked.
 
-   **What it gates, and why it is a launch.** A session costs ~1GB *only while
-   active*; idle ones sit swapped and cost nearly nothing. So:
-   - Gating **fan-out** gates a non-cost — subagents are extra contexts inside one
-     existing process, not new processes. Measured before building, twice.
-   - Gating a **prompt** destroys work already in flight, and fires hardest exactly
-     mid-thought.
-   - Gating a **launch** costs nothing when refused: nothing is lost, you close
-     something and start again. It is the last moment the machine can still say no
-     and be right.
+3. **Wire `admit` to something — it is built and reaches no one.** `pressured admit`
+   shipped in v0.3.0 and is aliased in exactly zero places: not `install.sh`, not the
+   README, nowhere. A gate no shell calls guards nothing. This is the cheapest move on
+   the board — a documented alias, or an installer prompt — and it is the only shipped
+   lever aimed at the felt gap at all. It ranks below #1 and #2 despite being nearly
+   free because of its own honest limit: it gates launch #8 and does nothing for the
+   seven sessions already open, nor for the one that grows after admission (#1). Use:
+   `alias claude='pressured admit --want 1024 -- claude'`.
 
-   Use: `alias claude='pressured admit --want 1024 -- claude'`.
+   *Design of the gate, retained because the reasoning is the reusable part.* It gates
+   a **launch**, not a prompt or a fan-out: a session costs ~1GB only while active, so
+   gating fan-out gates a non-cost (subagents are contexts in one existing process,
+   measured twice), gating a prompt destroys work mid-thought, and refusing a launch
+   costs nothing — you close something and start again. And it **fails OPEN**: no
+   daemon, a stale daemon, an unparseable reply all admit, because "I could not ask"
+   and "the answer is no" are different claims and a gate that conflates them refuses
+   all work whenever it is itself broken. `tight` admits with a warning — a guard rail,
+   not a nanny; one that balks at the first hint of scarcity gets aliased away within a
+   day, at which point it guards nothing.
 
-   **It fails OPEN, and that is the load-bearing decision.** No daemon, a stale
-   daemon, an unparseable reply — all admit. "I could not ask" and "the answer is
-   no" are different claims; a gate that conflates them refuses all work whenever it
-   is itself broken and blames memory pressure for it. That bug already shipped here
-   once (`render_budget` defaulted a missing verdict to "full"). `tight` admits too:
-   a guard rail, not a nanny — one that balks at the first hint of scarcity gets
-   aliased away within a day, at which point it guards nothing.
+4. **Close the proof loop — a wait, not a build.** The vital sign shipped (`health.rs`):
+   the spine's major-fault rate is sampled every tick, surfaced in the HUD as three
+   honest states (resident / waiting-on-disk / **unknown**), and written to the journal
+   as `SPINE HURT:` when a tick crosses the threshold. The threshold is **100
+   faults/tick — derived from measurement, not guessed.** The first version was 20 and
+   cried wolf within six minutes of shipping (an idle-desktop spike at PSI 0.1 with
+   nobody waiting); it was re-derived from two independent timed events — a 40s
+   wake-from-lock at 1.03 ms/fault and a cold embed at 1.99 ms/fault — to catch a real
+   stall while ignoring an idle blip. There is nothing left to build here: the
+   instrument is armed and has never fired in anger. The standing plan is *learn from
+   the next halt* — until one happens and `SPINE HURT` records it, this item is a
+   watch, not a task.
 
-2. **The guarantee is invisible** — *now built (2026-07-15), see `health.rs`.* The
-   spine's major-fault rate is sampled every tick, surfaced in the HUD as three
-   honest states (resident / waiting-on-disk / **unknown**), and written to the
-   journal as `SPINE HURT:` when a tick crosses the threshold. That last part is
-   the point: the standing plan is *learn from the next halt*, and until now nothing
-   would have recorded it. An evidence gate with no instrument behind it is a wish.
-
-   The threshold (20 faults/tick) is a **guess, marked as one in the source.** The
-   spine idles at 0, so the shape is right; where "noticeable" starts is unknown
-   because the only incident we have was never instrumented. Replace it with the
-   measured number after the first capture — and do not tune it against a healthy
-   machine, which is guessing wearing a lab coat.
-
-3. **Nothing protects the terminal the user is typing into** — the next real build.
-   Now measurable: with the fault-rate meter live, focus-following can be judged by
-   whether the focused window's fault rate actually drops, rather than by whether
-   the idea sounds right. Every previous lever was argued; this one can be tested.
-
-4. **`system.slice` is outside the pen.** The partition is spine-vs-`app.slice`, but
-   there is a third territory neither pinned nor capped. Measured 2026-07-15:
-   `ollama.service` has `memory.high = max`, sits at 280MB resident with 559MB
-   swapped, and takes **59 major faults/min while idle** — steady disk I/O for a
-   model nobody is using. It is not spine (nothing breaks if it's slow) and not
-   `app.slice` (so the ceiling never reaches it); `docker.service` and
-   `containerd.service` are in the same position. The harm is small today and the
-   hole is not: nothing bounds what a background service loads. **Do not just cap
-   `system.slice`** — it holds spine members too (the system bus). It needs the same
-   membership rule applied honestly, which is a real piece of design, not a knob.
+5. **`system.slice` is outside the pen — parked.** The partition is spine-vs-`app.slice`,
+   leaving a third territory neither pinned nor capped. It ranked #4 in July on the
+   strength of `ollama.service`: `memory.high = max`, 59 major faults/min while idle,
+   steady disk I/O for a model nobody was using. That concrete harm is going away — the
+   decision (2026-07-15) is to drop local ollama. `docker.service` and
+   `containerd.service` remain in the same position, but their idle harm is small.
+   Parked until something measurable comes back. If it does, the fix is **not** a blunt
+   cap on `system.slice` — it holds spine members too (the system bus) — but the same
+   honest membership rule applied to it, which is real design, not a knob.
 
 ---
 
 *Retained reasoning from the 2026-07-14 ranking, since the arithmetic is the
-reusable part:*
+reusable part. It records why the caller stayed unbuilt for two days and what
+finally changed — the conclusion is now superseded by v0.3.0 (see the paragraph
+ending this section):*
 
-**Admission control — the primitive, and why nothing calls it.** Everything else rtux
-does is post-hoc: pressure arrives, we react. The prior art is unanimous that the
+**Admission control — the primitive, and why it went so long uncalled.** Everything
+else rtux does is post-hoc: pressure arrives, we react. The prior art is unanimous that the
 guarantee never comes from clever scheduling — it comes from *refusing work that
 doesn't fit*. (`advise_claude_sessions` is **not** this: it notifies after the
 sessions are already running, and can be ignored.)
@@ -480,11 +492,16 @@ costs ~1GB **only while active**; idle ones sit swapped and cost nearly nothing
 halt is a *concurrency* problem — how many sessions are busy at once — not a
 count problem, and count-based admission control doesn't touch it.
 
-Stopped here for evidence rather than guessing a third time (2026-07-14). **That
-gate has since resolved (2026-07-15): 22h, no recurrence, spine at 0 faults/min
-— so the ceiling was the fix and the caller stays unbuilt.** Wiring one anyway
-would repeat the day's actual lesson — building on an unmeasured premise — with
-more ceremony.
+Stopped here for evidence rather than guessing a third time (2026-07-14). **The
+call finally came (v0.3.0, 2026-07-16), but not from this reasoning.** The
+2026-07-15 read was "22h, no recurrence, spine at 0 faults/min — the ceiling was
+the fix, wiring a caller repeats the day's lesson of building on an unmeasured
+premise." Then the halt recurred *the same day* and named a premise this arithmetic
+had missed: not a count problem and not a concurrency problem, but *unbounded per-
+session growth* — one session at 10.2GB. `pressured admit` shipped as the doorway
+gate; the growth bound it does not cover became the new #1 above. The lesson holds
+in an inverted form: the caller was right to wait for evidence, and wrong about what
+the evidence would say.
 
 **Nothing protects the terminal the user is typing into.** The rule is: mouse,
 typing, sound, WM, drawing — protected hard. But *typing* includes the window
@@ -496,10 +513,39 @@ typing" — the focused window is part of the interactive path *while focused*.
 
 ## Status
 
-**Validated in the wild (2026-07-12):** the full auto-mitigation fired under real
-memory pressure — froze a 1.1 GB browser to hold the desktop responsive and said
-so legibly, unprompted. The user's reaction ("oh nice") is the thesis confirmed:
-a resource crunch felt like the machine's competence, not its failure. The
-component pieces (freeze/thaw, protection, OOM immunity, throttle, socket, HUD,
-pin) were individually verified earlier; the PSI-Critical→freeze trip is
-now proven in production.
+Measured against the north star — *the machine should always feel as powerful as it
+actually is* — the two halves stand very differently as of v0.3.0 (2026-07-16).
+
+**The half that is done and provable: the spine never waits on disk.** Measured, not
+asserted — a ~130:1 major-fault partition between `app.slice` (33.7M faults since
+boot) and the spine (260k), 0 major faults/s at idle, and a `SPINE HURT` black box
+armed to record the first time that stops being true. Every claim rtux makes on this
+front now has an "I don't know" state rather than a confident wrong answer.
+
+**The half that is barely started: the machine feeling powerful *while* rtux reacts.**
+The 21:31 incident on 2026-07-15 is the honest scoreboard entry — rtux did everything
+right (spine held, ladder fired, thawed in 24s) and the machine still felt terrible,
+because the apps it froze were the user's seven working sessions. "Spine pinned, apps
+expendable" stops being true when the apps are your work. `pressured admit` is the
+first lever aimed here and it is unwired and partial; the growth bound that would
+actually close the gap (#1 above) is unbuilt.
+
+**Validated in the wild, chronologically:**
+
+- **2026-07-12** — the full auto-mitigation fired under real memory pressure: froze a
+  1.1 GB browser to hold the desktop responsive and said so legibly, unprompted. The
+  user's reaction ("oh nice") is the thesis confirmed — a resource crunch felt like
+  the machine's competence, not its failure. Component pieces (freeze/thaw,
+  protection, OOM immunity, throttle, socket, HUD, pin) were individually verified
+  earlier; the PSI-Critical→freeze trip proven in production.
+- **2026-07-14** — a global OOM took down dbus and logged the session out. Drove
+  v0.2.1: escalate to killing background hogs before the kernel does, protect the
+  session bus, bias the kernel OOM killer away from the spine.
+- **2026-07-15** — the ceiling held for 22h with no recurrence (spine 0 faults/min),
+  then two halts in one day exposed the *felt* gap above and named its cause
+  (unbounded per-session growth). Drove the v0.3.0 measurement work.
+- **v0.3.0 (2026-07-16)** — compositor floor tracks its real working set (was a
+  guessed 3% of RAM; cost 40s to wake from lock), the spine has a measured vital
+  sign, the HUD computes from the mitigator's own predicate instead of a lookalike,
+  notifications restored (AppArmor had silently denied them for days), and `pressured
+  admit` ships as the first admission-control caller.
