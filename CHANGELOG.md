@@ -5,6 +5,54 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Added — `pressured admit`: the admission-control caller
+
+`ctl budget` has been sitting unwired since it shipped, deliberately, waiting for an
+incident to name what to gate. Two arrived on 2026-07-15:
+
+    11:57  Froze claude · lexicon (10.2GB)   <- ONE session, 90% of an 11.4GB ceiling
+    21:31  7 Claude sessions are using 10.8GB — froze Firefox + 4 sessions in 30s
+
+The second is the instructive one: rtux did everything right — the spine held at 0
+major faults/s, the ladder fired, everything thawed 24s later — and the machine
+still felt terrible, because every app the user was looking at was paused. "Spine
+pinned, apps expendable" holds right up until the apps are your seven working
+sessions. Reacting well is not the same as not needing to react.
+
+    alias claude='pressured admit --want 1024 -- claude'
+
+**Gates a launch, not a prompt or a fan-out.** A session costs ~1GB only while
+active. Gating fan-out gates a non-cost (subagents are contexts in one existing
+process, not new processes — measured twice). Gating a prompt destroys work in
+flight. Refusing a *launch* costs nothing: you close something and start again.
+
+**Fails OPEN.** No daemon, stale daemon, unparseable reply → the command runs.
+"I could not ask" is not "the answer is no", and a gate that conflates them refuses
+all work whenever it is itself broken. `tight` admits too, with a warning — a guard
+rail, not a nanny. `--force` always wins. `exec`s rather than spawns, so the alias is
+invisible when it admits (exit codes, signals and the terminal all pass through).
+
+A refusal names what to close. The first draft filtered on the list reply's
+`freezable` flag and named the wrong things — Firefox (1.3GB) and Ollama (274MB)
+while 7.4GB of Claude sessions went unmentioned. See the known issue below.
+
+### Known issue — `ctl list` reports terminals as unfreezable; the daemon freezes them
+
+Two notions wearing one name. The list reply computes
+`freezable = has_freeze && !never_freeze(..)`, and `never_freeze` excludes
+TERMINAL_NAMES ("tmux", "vte-spawn", …) — so every Claude session in a tmux-spawn
+scope reports `freezable: false` and the HUD tags it `critical`, which reads as
+"protected". The daemon's freeze path uses `denied()`, which checks only
+`hard_exempt`, and freezes those sessions happily. Measured: `Froze claude · rtux
+(1.6GB)` against a list reply calling that exact scope unfreezable.
+
+The daemon's behaviour is the correct one per DESIGN ("apps within those terminals
+are expendable"); protecting the terminal you are actually *in* is already handled
+dynamically by `is_foreground_related` + the LIVE/touch set. The blanket
+TERMINAL_NAMES exclusion is a cruder, stale version of that, and the display is what
+is wrong. Not fixed here — changing the flag changes the HUD's `critical` tag
+broadly, which deserves its own change.
+
 ### Fixed — notifications, silently denied by AppArmor since the daemon was hardened
 
 rtux froze five apps during the 2026-07-15 incident and told the user about none of

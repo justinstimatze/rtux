@@ -338,14 +338,46 @@ happened while collecting this data, before the rate was measured — is the sam
 error as the display-string gate: a confident instrument reporting something that
 stopped being true. **The metric is d/dt, and a total is never a health signal.**
 
-1. ~~Admission control~~ **→ demoted. The evidence gate resolved: no.** The primitive
-   (`ctl budget`) ships and works, and the plan of record was to wire a caller only
-   if the halt recurred with the ceiling in place. It has not recurred in 22h, and
-   the spine is at 0 faults/min. Per the gate's own terms, **the ceiling was the fix
-   and a gate would be dead code.** Leave `ctl budget` unwired; it costs nothing
-   sitting there and is ready if a future incident names something to gate on.
-   Details of why the obvious caller was theatre are kept below, because the
-   reasoning is the reusable part.
+1. **Admission control — BUILT (`pressured admit`), because the evidence arrived.**
+   Twice on 2026-07-15 this was demoted as "the ceiling was the fix, a gate would be
+   dead code" — and then the halt recurred twice in one day and named its own cause:
+
+       11:57  Froze claude · lexicon (10.2GB)   <- ONE session, 90% of an 11.4GB ceiling
+       21:31  7 Claude sessions are using 10.8GB — froze Firefox + 4 sessions in 30s
+
+   Neither is what was guessed. It is not a *count* problem (the morning's theory)
+   and not a *concurrency* problem either (the afternoon's). Nothing bounds what the
+   sessions collectively hold, and the ceiling only converts that into throttling
+   and freezing after the fact.
+
+   The second incident is the instructive one, because rtux did everything right and
+   the machine still felt terrible. The spine held (0 major faults/s throughout — the
+   compositor and input method never touched disk), the ladder fired correctly, and
+   everything thawed 24s later. And the user's report was "the system still seemed
+   pretty unresponsive," because **every app they were looking at was paused.** That
+   is the architecture's own thesis biting: "spine pinned, apps expendable" is true
+   right up until the apps are your seven working sessions. Freezing them IS the
+   unresponsiveness. Reacting well is not the same as not needing to react.
+
+   **What it gates, and why it is a launch.** A session costs ~1GB *only while
+   active*; idle ones sit swapped and cost nearly nothing. So:
+   - Gating **fan-out** gates a non-cost — subagents are extra contexts inside one
+     existing process, not new processes. Measured before building, twice.
+   - Gating a **prompt** destroys work already in flight, and fires hardest exactly
+     mid-thought.
+   - Gating a **launch** costs nothing when refused: nothing is lost, you close
+     something and start again. It is the last moment the machine can still say no
+     and be right.
+
+   Use: `alias claude='pressured admit --want 1024 -- claude'`.
+
+   **It fails OPEN, and that is the load-bearing decision.** No daemon, a stale
+   daemon, an unparseable reply — all admit. "I could not ask" and "the answer is
+   no" are different claims; a gate that conflates them refuses all work whenever it
+   is itself broken and blames memory pressure for it. That bug already shipped here
+   once (`render_budget` defaulted a missing verdict to "full"). `tight` admits too:
+   a guard rail, not a nanny — one that balks at the first hint of scarcity gets
+   aliased away within a day, at which point it guards nothing.
 
 2. **The guarantee is invisible** — *now built (2026-07-15), see `health.rs`.* The
    spine's major-fault rate is sampled every tick, surfaced in the HUD as three

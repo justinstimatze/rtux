@@ -40,6 +40,27 @@ enum Commands {
     Daemon,
     /// Show current pressure levels and top consumers
     Status,
+    /// Run a command only if the machine can afford it — admission control.
+    ///
+    /// The gate `ctl budget` was built for. Refusing a *launch* costs nothing (you
+    /// close something and start again); refusing a prompt mid-session destroys
+    /// work in flight, and gating agent fan-out gates a non-cost. See cli::cmd_admit.
+    ///
+    /// Fails OPEN: no daemon, or a daemon too old to answer, means the command
+    /// runs. "I couldn't ask" is not "no".
+    ///
+    /// Use: alias claude='pressured admit --want 1024 -- claude'
+    Admit {
+        /// Megabytes the command is expected to need (a Claude session: ~1024).
+        #[arg(long)]
+        want: Option<u64>,
+        /// Run regardless of the verdict.
+        #[arg(long)]
+        force: bool,
+        /// The command to run, after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// Query/command the running daemon over its control socket
     Ctl {
         /// list | history | budget | touch | freeze | thaw | cap | uncap | kill | protect | unprotect
@@ -57,6 +78,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Daemon => run_daemon(),
         Commands::Status => cli::cmd_status(),
+        Commands::Admit { want, force, cmd } => cli::cmd_admit(want, force, &cmd),
         Commands::Ctl { action, id } => cli::cmd_ctl(&action, id.as_deref()),
     }
 }
