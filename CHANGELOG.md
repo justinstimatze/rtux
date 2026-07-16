@@ -5,6 +5,26 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+## [0.3.0] — measured, not guessed
+
+Every number rtux acted on used to be a guess, and on 2026-07-15 the guesses were
+billed. The compositor's floor was `total_ram/33` — 460MB against a measured 1.32GB
+working set — and waking the machine from lock took 40 seconds while the compositor
+faulted its own windows back off the swapfile. The spine's health was unmeasured, so
+nothing could tell you whether the one guarantee rtux makes was holding. The HUD
+tagged sessions `critical` while the daemon froze those same sessions. Notifications
+had been dead since the daemon was hardened, silently, for days.
+
+This release replaces each of those with a measurement: the floor now tracks
+`memory.current + memory.swap.current` (invariant to eviction, which is exactly why
+it is the right quantity), the spine reports a fault **rate** rather than a
+cumulative total (a total is a scar, a rate is a wound), the HUD computes its claims
+from the mitigator's own predicate, and every user-facing claim gained an "I don't
+know" state. `pressured admit` ships as the first lever aimed at the gap the day's
+two incidents exposed — rtux can react perfectly and the machine can still feel
+terrible, because "spine pinned, apps expendable" stops being true when the apps
+are your seven working sessions.
+
 ### Added — `pressured admit`: the admission-control caller
 
 `ctl budget` has been sitting unwired since it shipped, deliberately, waiting for an
@@ -451,7 +471,8 @@ The initial public cut: a working, validated desktop-responsiveness daemon.
 - Installer, uninstaller, hotkey and extension setup scripts; a contained latency
   benchmark under `benchmarks/`.
 
-[Unreleased]: https://github.com/justinstimatze/rtux/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/justinstimatze/rtux/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/justinstimatze/rtux/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/justinstimatze/rtux/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/justinstimatze/rtux/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/justinstimatze/rtux/releases/tag/v0.1.0
