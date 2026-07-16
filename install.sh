@@ -16,6 +16,24 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
+# Notification runtime deps. Warn, never fail: a daemon that protects the desktop
+# is still worth running when it can only report to the journal, and refusing to
+# install over a missing notifier would be the tail wagging the dog.
+#
+# gdbus (not notify-send) because Ubuntu ships an AppArmor profile for notify-send
+# that permits /run/user/*/bus — and inside the mount namespace this unit runs in,
+# AppArmor cannot resolve that path back to the root namespace, hands the matcher a
+# *relative* name, and denies the connect. gdbus and dbus-monitor carry no profile,
+# so nothing mediates them. See src/notify.rs for the kernel's own account of it.
+for tool in gdbus:libglib2.0-bin dbus-monitor:dbus-bin; do
+    cmd="${tool%%:*}"; pkg="${tool##*:}"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "warning: $cmd not found — desktop notifications will not render."
+        echo "         Interventions still land in the journal (journalctl -u rtux.service)."
+        echo "         Install with:  sudo apt install $pkg"
+    fi
+done
+
 echo "Installing binary → /usr/local/bin/pressured"
 install -m 0755 "$BIN" /usr/local/bin/pressured
 
