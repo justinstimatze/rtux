@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::classify;
 use crate::guard::format_bytes;
 use crate::{actions, cgroup, guard, notify};
 
@@ -8,97 +9,6 @@ use crate::{actions, cgroup, guard, notify};
 /// before the relaunch can race it) and spawn a new process, which reliably
 /// jumps to the front. Mirrored in `setup-hotkey.sh` and the GNOME extension.
 pub const SUMMON_HUD: &str = "pkill -KILL -x pressured-hud; for i in $(seq 50); do pgrep -x pressured-hud >/dev/null || break; sleep 0.02; done; pressured-hud";
-
-/// Hard-exempt cgroups: the auto-mitigator must never freeze OR kill these —
-/// doing so breaks the session, the display, or the daemon itself. The session
-/// spine + system-critical services + PID 1 + the protector. Matched as
-/// substrings against both the raw cgroup dir name and the humanized app name.
-const HARD_EXEMPT_NAMES: &[&str] = &[
-    // compositor / display
-    "org.gnome.Shell", "gnome-shell", "kwin", "sway", "plasmashell",
-    "Xorg", "Xwayland", "mutter",
-    // audio
-    "pipewire", "pulseaudio", "wireplumber",
-    // session / system critical
-    "dbus", "systemd", "gnome-keyring", "polkit", "gdm", "sddm",
-    "display-manager", "NetworkManager", "sshd", "accounts-daemon", "rtkit",
-    "gvfs", "xdg-desktop-portal", "gnome-session",
-    // PID 1 lives here — freezing/killing it takes down the whole system.
-    "init.scope",
-    // the protector itself
-    "rtux", "pressured",
-];
-
-/// Interactive terminals. Spared from *automatic* freeze/kill only while they're
-/// the foreground (or descend from it) — see `denied`. A BACKGROUND terminal
-/// session (an idle shell, a build, a Claude session you're not looking at) is a
-/// legitimate target: that's where this machine's pressure actually comes from,
-/// and blanket-exempting it is why rtux used to sit helpless while the session
-/// climbed to a global-OOM crash. Still refused for user-initiated HUD actions
-/// (never_freeze stays a union), which is the conservative default there.
-const TERMINAL_NAMES: &[&str] = &[
-    "vte-spawn", "gnome-terminal", "konsole", "kitty", "alacritty",
-    "xterm", "tmux", "screen", "terminator",
-];
-
-fn matches_any(name: &str, raw_dir_name: &str, list: &[&str]) -> bool {
-    list.iter().any(|d| raw_dir_name.contains(d) || name.contains(d))
-}
-
-/// Hard-exempt from *automatic* mitigation (freeze or kill), and from the
-/// foreground protection path — the spine/system/daemon must never be pinned,
-/// boosted, or relaxed as if it were an ordinary focused app. Terminals are NOT
-/// hard-exempt: a focused terminal is a legitimate foreground to favour.
-pub fn hard_exempt(name: &str, raw_dir_name: &str) -> bool {
-    matches_any(name, raw_dir_name, HARD_EXEMPT_NAMES)
-}
-
-/// True if this cgroup must never be frozen via the IPC/HUD path. Unchanged
-/// behaviour: the hard-exempt spine *and* every terminal (the conservative
-/// default for user-initiated actions). The auto-mitigator uses the finer
-/// `hard_exempt` + foreground checks in `denied` instead.
-pub fn never_freeze(name: &str, raw_dir_name: &str) -> bool {
-    hard_exempt(name, raw_dir_name) || matches_any(name, raw_dir_name, TERMINAL_NAMES)
-}
-
-/// True if the auto-mitigator would spare this cgroup **right now** because the
-/// user is demonstrably using it: it's the foreground window (or descends from
-/// it), or it reported a keystroke recently (see ipc::LIVE).
-///
-/// Dynamic and momentary, unlike `hard_exempt` — this same cgroup is a legitimate
-/// target thirty seconds after you stop typing in it, which is the entire point.
-/// Exposed so the HUD can say *why* something won't be paused instead of implying
-/// it can never be. `denied` remains the authority; this is the subset of it that
-/// is about attention rather than about structure.
-pub fn spared_now(path: &Path) -> bool {
-    is_foreground_related(path) || crate::ipc::touched_recently(path)
-}
-
-/// True if `path` is the foreground window's cgroup, or hosts any process that
-/// descends from the foreground window's pid — i.e. the terminal the user is in
-/// and all of its tabs. Such cgroups are spared from automatic freeze/kill so we
-/// never touch what the user is actively working in. Returns false when nothing
-/// has reported focus yet (fail-open: better to act than to freeze on ambiguity
-/// under real pressure — the hard-exempt spine is still protected regardless).
-fn is_foreground_related(path: &Path) -> bool {
-    let Some(fg_pid) = crate::ipc::foreground_pid() else {
-        return false;
-    };
-    if let Some(fg_cg) = cgroup::cgroup_of_pid(fg_pid) {
-        if fg_cg == path {
-            return true;
-        }
-    }
-    let Ok(procs) = std::fs::read_to_string(path.join("cgroup.procs")) else {
-        return false;
-    };
-    procs.lines().any(|l| {
-        l.trim()
-            .parse::<i32>()
-            .map(|pid| cgroup::pid_descends_from(pid, fg_pid))
-            .unwrap_or(false)
-    })
-}
 
 /// Choose the kill victim's index from `is_claude` flags in largest-first order.
 /// Policy (B→C→A): prefer the largest *non-Claude* hog (a browser dies before a
@@ -132,79 +42,11 @@ fn display_name(path: &Path, fallback: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The display bug, pinned. `never_freeze` and `hard_exempt` answer different
-    /// questions, and the list reply asked the wrong one — so every Claude session
-    /// in a tmux-spawn scope reported unfreezable and the HUD tagged it `critical`,
-    /// which reads as "protected", while the daemon froze it under pressure
-    /// (measured 2026-07-15: "Froze claude · rtux (1.6GB)").
-    ///
-    /// Real scope names from rukh. `name` is what `cgroup_to_app_name` yields for a
-    /// terminal child scope — which is what BOTH callers actually pass. Not the
-    /// "claude · rtux" display label: see the collision test below for why that
-    /// distinction is load-bearing rather than pedantic.
-    #[test]
-    fn a_background_claude_session_is_freezable_even_though_a_client_may_not_freeze_it() {
-        let raw = "tmux-spawn-0b244635-6078-4edf-8f7d-3075ad3fd91f.scope";
-        let name = "Terminal (child)";
-        // What the auto-mitigator asks — and it WILL pause this under pressure.
-        assert!(!hard_exempt(name, raw), "the daemon freezes background sessions; say so");
-        // What a CLIENT may do — deliberately conservative, and correctly unchanged.
-        assert!(never_freeze(name, raw), "ctl freeze on a terminal stays refused");
-    }
-
-    /// vte-spawn scopes (a plain gnome-terminal tab) behave the same way.
-    #[test]
-    fn a_vte_terminal_scope_is_also_freezable_by_the_daemon() {
-        let raw = "vte-spawn-89fbb249-eb90-4ee7-b2bc-000000000000.scope";
-        assert!(!hard_exempt("Terminal (child)", raw));
-        assert!(never_freeze("Terminal (child)", raw));
-    }
-
-    /// **Never pass a display label to these predicates.** They match by SUBSTRING
-    /// against a list that includes the protector's own names, so the pretty label
-    /// for a session working on this very repo — "claude · rtux" — contains "rtux"
-    /// and hard-exempts itself. A user whose directory is named `dbus`, `systemd`,
-    /// `pressured` or `rtux` would silently become unfreezable, and the mitigator
-    /// would skip the biggest hog on the box while reporting itself healthy.
-    ///
-    /// Not a live bug: both callers pass `cgroup_to_app_name`'s output ("Terminal
-    /// (child)"), and the display label is computed afterwards, for humans only.
-    /// This test exists because an earlier draft of the test above passed the label
-    /// and failed — the trap is one keystroke away and completely silent.
-    #[test]
-    fn a_display_label_must_never_reach_these_predicates() {
-        let raw = "tmux-spawn-0b244635-6078-4edf-8f7d-3075ad3fd91f.scope";
-        assert!(
-            hard_exempt("claude · rtux", raw),
-            "if this ever stops matching, the collision is gone and this test can go"
-        );
-        assert!(hard_exempt("claude · pressured", raw));
-        // ...whereas the name the code really passes is safe.
-        assert!(!hard_exempt("Terminal (child)", raw));
-    }
-
-    /// The spine must read as `critical` under BOTH predicates — the fix must not
-    /// have widened what the mitigator will touch.
-    #[test]
-    fn the_spine_stays_hard_exempt_under_the_new_predicate() {
-        for (name, raw) in [
-            ("org.gnome.Shell", "org.gnome.Shell@ubuntu.service"),
-            ("pipewire", "pipewire.service"),
-            ("wireplumber", "wireplumber.service"),
-            ("dbus", "dbus.service"),
-        ] {
-            assert!(hard_exempt(name, raw), "{name} must never be auto-frozen");
-            assert!(never_freeze(name, raw), "{name} must never be client-frozen");
-        }
-    }
-
-    /// Firefox is an ordinary app under both — no terminal name to match.
-    #[test]
-    fn an_ordinary_app_was_never_affected_by_the_bug() {
-        let raw = "snap.firefox.firefox-247a1653-e08f-4045-9845-9cc6ac38b2f6.scope";
-        assert!(!hard_exempt("Firefox", raw));
-        assert!(!never_freeze("Firefox", raw));
-    }
+    // The classification predicates these tests used to exercise (hard_exempt,
+    // never_freeze, and the class of a background vs focused session) now live in
+    // `crate::classify`, and so do their tests — including the display-label
+    // collision trap and the July HUD-bug regression. What stays here is the one
+    // decision that is genuinely the eviction effector's own: victim ranking.
 
     #[test]
     fn victim_ranking_prefers_non_claude_then_largest_first() {
@@ -379,38 +221,36 @@ impl Mitigator {
         }
     }
 
+    /// True when the eviction effector must leave this cgroup alone. Now a single
+    /// class question routed through `classify`, plus one mechanism guard: the
+    /// Guaranteed spine and the Focused workload are `protected_from_eviction`, and
+    /// we additionally never touch the daemon's own cgroup subtree. The old
+    /// hand-rolled OR of hard_exempt / foreground / touched-recently *was* this
+    /// class question; it just wasn't named, and `ipc` re-derived it a slightly
+    /// different way — the seam behind the July HUD bug.
     fn denied(&self, name: &str, path: &Path) -> bool {
         let raw = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        // The spine/system/daemon are always off-limits (freeze OR kill).
-        if hard_exempt(name, &raw) {
+        // Guaranteed spine — structural and cheap; short-circuit before any IO.
+        if classify::hard_exempt(name, &raw) {
             return true;
         }
-        // Never act on ourselves, an ancestor of us, or a descendant of us.
+        // Never act on ourselves, an ancestor of us, or a descendant of us. A
+        // mechanism guard, not a class question: the daemon's own name is already
+        // Guaranteed, but a child scope it spawned may not match that name.
         if let Some(self_cg) = &self.self_cgroup {
             if self_cg.starts_with(path) || path.starts_with(self_cg) {
                 return true;
             }
         }
-        // Spare whatever the user is actively using: the foreground window's own
-        // cgroup and anything whose processes descend from it (the terminal
-        // you're in and all its tabs). Everything else in the background is fair
-        // game — including background terminal/Claude sessions.
-        if is_foreground_related(path) {
-            return true;
-        }
-        // …but the check above is blind under tmux: a pane descends from the tmux
-        // server, not from the focused window, so it reported the pane being typed
-        // in as background and we froze it mid-keystroke. A session that says a
-        // human just typed in it is spared on its own word (see ipc::LIVE), which
-        // is the only signal that survives tmux. Bounded by TTL and MAX_LIVE, so
-        // this can never starve the mitigator of candidates.
-        if crate::ipc::touched_recently(path) {
-            return true;
-        }
-        false
+        // Focused — the dynamic attention overlay: the foreground window (and its
+        // tabs), or a pane a human just typed in (the only signal that survives
+        // tmux, where a pane descends from the server not the focused window).
+        // Resolved only now, since `observe` does IO and the cheap checks above
+        // have already ruled out the spine and ourselves.
+        classify::classify(&classify::observe(name, &raw, path)).protected_from_eviction()
     }
 
     /// Critical pressure: freeze the single largest freezable consumer.

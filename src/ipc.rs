@@ -5,7 +5,7 @@ use std::thread;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{actions, cgroup, guard, mitigate, notify, psi};
+use crate::{actions, cgroup, classify, guard, mitigate, notify, psi};
 
 pub const SOCKET_PATH: &str = "/run/pressured.sock";
 const LIST_MIN_BYTES: u64 = 100 * 1024 * 1024; // surface apps >= 100 MB
@@ -246,8 +246,8 @@ fn build_list() -> ListReply {
         .find(|a| {
             a.has_freeze
                 && a.mem >= mitigate::MIN_FREEZE_BYTES
-                && !mitigate::hard_exempt(&a.name, &a.raw)
-                && !mitigate::spared_now(&a.path)
+                && !classify::hard_exempt(&a.name, &a.raw)
+                && !classify::spared_now(&a.path)
         })
         .map(|a| a.path.clone());
 
@@ -263,12 +263,12 @@ fn build_list() -> ListReply {
             // "Froze claude · rtux (1.6GB)" against a reply calling that exact scope
             // unfreezable). A display that contradicts the daemon is the same defect
             // as the display-string gate and the cumulative-fault scar.
-            let freezable = a.has_freeze && !mitigate::hard_exempt(&a.name, &a.raw);
+            let freezable = a.has_freeze && !classify::hard_exempt(&a.name, &a.raw);
             // Whether it is spared *at this moment* is a separate fact from whether
             // it is eligible at all, and collapsing the two is how the original bug
             // read as "protected" forever. Carried so the HUD can say "not right
             // now, you're using it" rather than "never".
-            let spared = mitigate::spared_now(&a.path);
+            let spared = classify::spared_now(&a.path);
             let id = a
                 .path
                 .strip_prefix(CGROUP_BASE)
@@ -497,7 +497,7 @@ fn do_foreground(pid: i32) -> ActReply {
     // already protects those and we must not disturb them. A focused *terminal*
     // is NOT hard-exempt: it's a legitimate foreground to favour (memory pin +
     // cpu.weight boost), which matters since the user is often typing in one.
-    if mitigate::hard_exempt(&name, &raw) {
+    if classify::hard_exempt(&name, &raw) {
         return ActReply { ok: true, msg: format!("{} is a protected service — left as-is", name) };
     }
 
@@ -542,7 +542,7 @@ fn permitted_target(path: &std::path::Path, action: &str) -> bool {
     // (init.scope) or a critical parent can't be reached through a child id.
     for comp in path.components() {
         let c = comp.as_os_str().to_string_lossy();
-        if mitigate::never_freeze(&c, &c) {
+        if classify::never_freeze(&c, &c) {
             return false;
         }
     }
