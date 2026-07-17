@@ -1,87 +1,68 @@
 #!/usr/bin/env bash
-# io-delegation-spike.sh — prove the io controller can be delegated to user apps,
-# reversibly, then put the machine back exactly as it was.
+# io-delegation-spike.sh — delegate the io controller to user apps, then let you
+# verify it after a re-login. Reversible: a /run drop-in that reboot-clears, or
+# `--revert` to remove it now.
 #
 # THE GAP (traced 2026-07-16 on rukh, systemd 259): user apps get only
 # `cpu memory pids` delegated. cgroup v2's io controller is available at the root
 # and at user.slice, but user@1000.service runs with the Ubuntu vendor default
 # `Delegate=pids memory cpu` (/usr/lib/systemd/system/user@.service:28), so the
-# per-user `systemd --user` instance is structurally forbidden from managing io on
-# anything it owns — app.slice included. IOAccounting=yes is the WRONG lever: you
-# cannot account for a controller you were never delegated. The right lever is
-# Delegate=: add `io cpuset` to the delegated set on user@.service.
+# per-user `systemd --user` instance can never manage io on app.slice. The fix is
+# a `Delegate=` drop-in adding `io cpuset` to that set.
 #
-# The realised cgroup subtree of a running user@N.service is fixed at login, so the
-# change only reaches a live app.slice for sessions started AFTER a daemon-reload —
-# re-delegating a running session would mean restarting user@1000.service, which
-# tears the whole desktop down. So this spike proves the SYSTEMD SIDE without a
-# logout: it writes a /run drop-in (reboot-clears), reloads, and confirms
-# user@.service now reports `io cpuset` in its delegated set — i.e. systemd accepts
-# the config. The controller actually landing in app.slice is a next-login step.
+# WHY THERE IS NO LIVE, NO-LOGOUT PROOF: a running user@N.service realises its
+# delegated controllers once, at login, and will not re-delegate without a restart
+# (which logs you out). The template unit exposes no resolved DelegateControllers to
+# preview. So the ONLY ground truth is app.slice/cgroup.controllers after a fresh
+# login. This script applies the change and hands you that one check.
 #
-# Needs: sudo (writes a /run drop-in + daemon-reload). No --user bus required.
+# Needs: sudo (writes a /run drop-in + daemon-reload).
 #
-# Run:  ./scripts/io-delegation-spike.sh
+#   ./scripts/io-delegation-spike.sh            # apply, then re-login and check
+#   ./scripts/io-delegation-spike.sh --revert   # remove the drop-in now
 set -uo pipefail
 
-UNIT=user@.service
 DROPDIR=/run/systemd/system/user@.service.d
 DROPIN="$DROPDIR/zz-pressured-io-spike.conf"
+APP=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice
+CHECK="grep -qw io $APP/cgroup.controllers && echo 'PASS: io reached app.slice' || echo 'FAIL: still no io'"
 
-delegated() { systemctl show "$UNIT" -p DelegateControllers --value 2>/dev/null; }
-has_io()    { delegated | grep -qw io; }
-
-revert() {
-  echo
-  echo "== reverting (restoring the exact prior state) =="
+if [ "${1:-}" = "--revert" ]; then
   sudo rm -f "$DROPIN"
-  sudo rmdir "$DROPDIR" 2>/dev/null   # only succeeds if we created it and it's empty
+  sudo rmdir "$DROPDIR" 2>/dev/null
   sudo systemctl daemon-reload
-  if has_io; then
-    echo "!! WARNING: io still in the delegated set after revert."
-    echo "   Clear it by rebooting (the drop-in was under /run and does not persist)."
-  else
-    echo "ok — user@.service back to delegating: [$(delegated)]"
-  fi
-}
-trap revert EXIT
+  echo "reverted — drop-in removed. Log out and back in to drop io from app.slice."
+  exit 0
+fi
 
-echo "== BEFORE =="
-echo "user@.service delegates: [$(delegated)]"
-if has_io; then
-  echo "io is ALREADY delegated — nothing to prove. Exiting without changes."
-  trap - EXIT
+echo "== current app.slice controllers =="
+cat "$APP/cgroup.controllers"
+if grep -qw io "$APP/cgroup.controllers"; then
+  echo "io is ALREADY delegated to app.slice — nothing to do."
   exit 0
 fi
 
 echo
-echo "== writing a runtime Delegate= drop-in (needs sudo) =="
+echo "== writing the Delegate= drop-in to /run (needs sudo) =="
 sudo install -d -m 0755 "$DROPDIR" || { echo "!! could not create $DROPDIR"; exit 1; }
-# Vendor default is `Delegate=pids memory cpu`; add io + cpuset (cpuset for the
-# CPU-idle effector). A drop-in Delegate= replaces the value, so restate the base set.
+# A drop-in Delegate= replaces the value, so restate the vendor base set + io cpuset.
 printf '[Service]\nDelegate=pids memory cpu io cpuset\n' \
   | sudo tee "$DROPIN" >/dev/null || { echo "!! could not write $DROPIN"; exit 1; }
-
-echo "== daemon-reload so systemd re-reads user@.service =="
 sudo systemctl daemon-reload
 
-echo
-echo "== AFTER =="
-echo "user@.service delegates: [$(delegated)]"
+cat <<EOF
 
-if has_io; then
-  echo
-  echo "PASS — systemd accepts io in the delegated set for user@.service."
-  echo "   The controller reaches app.slice for sessions started after this reload;"
-  echo "   your CURRENT session keeps its old delegation until next login."
-  echo
-  echo "=> The plug works. rtux's installer can ship this as a persistent drop-in"
-  echo "   next to 50-pressured-oomd.conf (drop the /run path), gated on a"
-  echo "   capability check, and prompt for a re-login to activate it live."
-else
-  echo
-  echo "FAIL — io did not enter the delegated set. This build/policy refuses io"
-  echo "delegation to user@.service; the controller should treat IO as"
-  echo "capability-detected, not assumed."
-fi
-# trap runs revert on the way out.
+Applied. This CANNOT take effect on your current session — user@1000.service
+fixed its delegation at login. To activate and verify:
+
+  1. Log out and back in (or reboot).
+  2. Run this check:
+
+     $CHECK
+
+PASS means the installer can ship this as a persistent drop-in beside
+50-pressured-oomd.conf and the daemon can drive io.latency on app scopes.
+
+To undo without a reboot:  ./scripts/io-delegation-spike.sh --revert
+(The drop-in lives under /run, so a reboot also clears it.)
+EOF
