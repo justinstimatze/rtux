@@ -540,14 +540,21 @@ The right lever is `Delegate=`. A one-line drop-in on `user@.service` —
 every ancestor up the chain so it can be handed down. (`cpuset` rides along for free
 and the CPU-idle effector wants it too.) rtux already ships a drop-in in exactly this
 directory — `50-pressured-oomd.conf` — so the delegation override sits right beside it.
-The one caveat is that `user@1000.service`'s cgroup subtree is realised at login, so
-the change lands for sessions started *after* a `daemon-reload` — a next-login step,
-not a live re-delegation (re-delegating a running session would mean restarting
-`user@1000.service`, which tears the session down). `scripts/io-delegation-spike.sh`
-writes the drop-in to `/run` (runtime, reboot-clears), reloads, confirms `user@.service`
-now reports `io cpuset` in its delegated set, then reverts — proving systemd accepts
-the config without touching the live session. Boxes where io still can't be delegated
-treat IO as capability-detected and simply skip that effector.
+
+**There is no live, no-logout proof of this — and that shaped the design.** A running
+`user@1000.service` realises its delegated controllers *once, at login*, and will not
+re-delegate without a restart (which is a logout); the template `user@.service` exposes
+no resolved `DelegateControllers` to preview. So the only ground truth is
+`app.slice/cgroup.controllers` *after a fresh login* — an early spike that tried to
+verify reversibly within one session was chasing something structurally unobservable.
+The deployment is therefore honest about the seam it crosses: the installer lays the
+drop-in, prompts for a re-login, and **the daemon capability-detects io on `app.slice`
+at startup** — if it is absent, the IO effector is simply skipped. That detection is the
+real safety net, not a pre-flight check, and it makes the change reversible by
+construction (delete the drop-in, log back in). `scripts/io-delegation-spike.sh` applies
+the drop-in to `/run` (reboot-clears) and hands you the one check that means anything —
+`grep -w io …/app.slice/cgroup.controllers` after re-login — with a `--revert` to pull
+it now.
 
 **The honest limit:** `io.latency` cannot rescue a fault already in flight — that is a
 residency problem `memory.min` already owns. What it protects is the fault *stream*
