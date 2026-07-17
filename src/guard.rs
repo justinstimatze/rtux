@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use crate::cgroup;
+use crate::classify::Class;
 
 const CGROUP_BASE: &str = "/sys/fs/cgroup";
 
@@ -714,6 +715,26 @@ const CPU_WEIGHT_FOREGROUND: u32 = 1000;
 /// The kernel default cpu.weight — what a released foreground leaf returns to.
 const CPU_WEIGHT_DEFAULT: u32 = 100;
 
+/// The CPU effector's policy, keyed on class: what `cpu.weight` a workload of this
+/// class earns. This is the *standing, work-conserving* half of the actuator map —
+/// a preference that costs nothing when the CPU is uncontended, never a reactive
+/// ceiling. (cgroup v2 has no `cpu.min`, so a real CPU floor is inexpressible; a
+/// reactive `cpu.max` cap on the complement was tried and measured as a regression
+/// — see the tombstone in `main.rs`. We deliberately do not fake a floor.)
+///
+/// Guaranteed and Focused both win the scheduler (1000); Active sits at the kernel
+/// default (100). Idle *should* be demoted to `cpu.idle` rather than a weight, but
+/// the fast tier doesn't produce the Idle class yet (it needs the idle/fault
+/// signal, a later phase), so for now it earns the same default as Active — which
+/// is exactly today's behaviour, just named.
+fn cpu_weight_for(class: Class) -> u32 {
+    match class {
+        Class::Guaranteed => CPU_WEIGHT_DESKTOP,
+        Class::Focused => CPU_WEIGHT_FOREGROUND,
+        Class::Active | Class::Idle => CPU_WEIGHT_DEFAULT,
+    }
+}
+
 /// Give the desktop slice priority over bulk app work under CPU contention.
 /// `cpu.weight` is proportional *among siblings*, so the lever that favours the
 /// compositor (in session.slice) over the hogs (in app.slice) is session.slice's
@@ -722,7 +743,9 @@ const CPU_WEIGHT_DEFAULT: u32 = 100;
 fn set_desktop_cpu_priority(compositor_path: &Path) {
     let Some(session_slice) = compositor_path.parent() else { return };
     cgroup::ensure_cpu_controller(compositor_path);
-    if let Err(e) = crate::actions::set_cpu_weight(session_slice, CPU_WEIGHT_DESKTOP) {
+    // The Guaranteed tier's standing scheduler reservation: session.slice, which
+    // hosts the spine, outweighs app.slice's bulk work.
+    if let Err(e) = crate::actions::set_cpu_weight(session_slice, cpu_weight_for(Class::Guaranteed)) {
         eprintln!("  note: could not set desktop cpu.weight ({e})");
     }
     // Also enable the cpu controller on the sibling app.slice now, so foreground
@@ -1236,9 +1259,9 @@ pub fn unprotect_cgroup(cgroup_path: &std::path::Path) -> Result<()> {
     // only the session left to kill (2026-07-14). Neutral, not the hog bias: this
     // app was legitimately in use a moment ago.
     set_oom_score_adj(cgroup_path, OOM_SCORE_ADJ_NEUTRAL);
-    // Drop any foreground CPU boost back to default when focus leaves this app
-    // (harmless no-op for a leaf that was never boosted).
-    let _ = crate::actions::set_cpu_weight(cgroup_path, CPU_WEIGHT_DEFAULT);
+    // Drop the CPU boost as focus leaves: the app falls from Focused back to
+    // Active (harmless no-op for a leaf that was never boosted).
+    let _ = crate::actions::set_cpu_weight(cgroup_path, cpu_weight_for(Class::Active));
     Ok(())
 }
 
@@ -1262,9 +1285,10 @@ pub fn protect_foreground(cgroup_path: &std::path::Path) -> Result<()> {
     // window you work in for death while reporting it as protected.
     set_oom_score_adj(cgroup_path, OOM_SCORE_ADJ_PROTECT);
     // CPU: favour the focused app among its slice siblings — the scheduler dual
-    // of the memory pin. unprotect_cgroup drops it back to default on focus change.
+    // of the memory pin, and the Focused tier of the CPU effector. unprotect_cgroup
+    // drops it back to the Active default on focus change.
     cgroup::ensure_cpu_controller(cgroup_path);
-    let _ = crate::actions::set_cpu_weight(cgroup_path, CPU_WEIGHT_FOREGROUND);
+    let _ = crate::actions::set_cpu_weight(cgroup_path, cpu_weight_for(Class::Focused));
     result
 }
 
@@ -1315,6 +1339,27 @@ mod tests {
         // Releasing everything clears the map entirely — no residue.
         p.clear();
         assert!(desired_min_map(&p, base).is_empty());
+    }
+
+    /// The CPU effector's standing policy: the two classes the user needs win the
+    /// scheduler; the rest sit at the kernel default. Pins the numbers so a future
+    /// edit to the class map can't silently un-favour the desktop or the focused
+    /// window — and documents that Idle earns the Active default until its signal
+    /// lands (no reactive ceiling, ever; see the tombstone in main.rs).
+    #[test]
+    fn cpu_weight_follows_class() {
+        use super::{cpu_weight_for, CPU_WEIGHT_DEFAULT, CPU_WEIGHT_DESKTOP, CPU_WEIGHT_FOREGROUND};
+        use crate::classify::Class;
+        assert_eq!(cpu_weight_for(Class::Guaranteed), CPU_WEIGHT_DESKTOP);
+        assert_eq!(cpu_weight_for(Class::Focused), CPU_WEIGHT_FOREGROUND);
+        assert_eq!(cpu_weight_for(Class::Active), CPU_WEIGHT_DEFAULT);
+        // Idle is not yet produced; it rides the Active default rather than a fake
+        // floor. When the idle signal lands this becomes cpu.idle, not a lower weight.
+        assert_eq!(cpu_weight_for(Class::Idle), CPU_WEIGHT_DEFAULT);
+        // The two favoured classes must actually outrank Active, or the effector is
+        // a no-op dressed as a preference.
+        assert!(cpu_weight_for(Class::Focused) > cpu_weight_for(Class::Active));
+        assert!(cpu_weight_for(Class::Guaranteed) > cpu_weight_for(Class::Active));
     }
 }
 

@@ -131,6 +131,152 @@ fn protect_and_report(verbose: bool, announced: &mut HashSet<String>) {
     }
 }
 
+/// The daemon's standing state, carried across reconcile ticks. One place instead
+/// of a fistful of `let mut` locals threaded through the loop — and the seam the
+/// controller's later phases hang off (each becomes a step inside `reconcile`).
+struct Daemon {
+    notifier: notify::Notifier,
+    mitigator: mitigate::Mitigator,
+    /// The instrument: the spine's major-fault rate, the outcome metric. Seeded at
+    /// construction so its first tick reports a delta, not a lifetime scar.
+    meter: health::FaultMeter,
+    /// Spine services already announced as protected — keeps the 30s re-assert quiet.
+    announced: HashSet<String>,
+    ticks: u64,
+    /// Consecutive normal-pressure ticks, for thaw hysteresis (see the const).
+    normal_streak: u32,
+}
+
+impl Daemon {
+    fn new() -> Self {
+        Self {
+            notifier: notify::Notifier::new(),
+            mitigator: mitigate::Mitigator::new(),
+            meter: health::FaultMeter::new(),
+            announced: HashSet::new(),
+            ticks: 0,
+            normal_streak: 0,
+        }
+    }
+
+    /// One turn of the control loop: **observe** the machine, **classify** the
+    /// pressure, **actuate**. The caller sleeps between turns. Structured as the
+    /// three reconcile phases so each later controller phase has an obvious home,
+    /// but the behaviour is exactly the two-cadence loop this replaced.
+    fn reconcile(&mut self) {
+        self.ticks += 1;
+
+        // ── ACTUATE (standing) ────────────────────────────────────────────────
+        // Re-assert the class-driven protections every 30s — ALWAYS, not just
+        // until the first success. Protection is not a one-shot: memory.min lives
+        // on the cgroup and the CPU effector's standing weights (guard) persist,
+        // but oom_score_adj is per-PROCESS and only ever applied to the pids alive
+        // at the time. A service restart, and above all a re-login (which builds a
+        // whole new session tree), leaves the new processes unprotected forever —
+        // the old `!protected` latch ran once and never again. Measured after the
+        // 2026-07-14 logout: the session's dbus and pipewire sat at +200 while the
+        // daemon believed the spine protected. Re-applying is idempotent and cheap;
+        // `announced` keeps the journal quiet.
+        if self.ticks % 30 == 0 {
+            protect_and_report(false, &mut self.announced);
+            // Re-enumerate on the same cadence and for the same reason: a re-login
+            // builds a new session tree, and a meter holding the dead session's
+            // paths would report a flatlined-because-gone spine as a healthy one.
+            self.meter.refresh_spine();
+        }
+
+        // ── OBSERVE ───────────────────────────────────────────────────────────
+        // Sample the spine's fault rate BEFORE reading PSI and deciding what to do.
+        // This is the outcome metric — whether the interactive path is waiting on
+        // disk right now — and it is measured unconditionally, at every pressure
+        // level, because the harm we care about does not announce itself via PSI
+        // first. The 19s stall ran at cpu PSI 2.28 and memory PSI no threshold here
+        // would have called critical; what it had was the input method faulting on
+        // every keypress. That is what this counts.
+        self.meter.tick();
+
+        let mem_psi = match psi::read_psi("/proc/pressure/memory") {
+            Ok(r) => r,
+            Err(e) => {
+                // A transient read hiccup must not take the protector down. The
+                // caller still sleeps this tick, so cadence is unchanged.
+                eprintln!("warning: reading memory PSI failed ({}); retrying", e);
+                return;
+            }
+        };
+        let level = psi::classify_pressure(&mem_psi);
+        // Feed the rolling pressure history the HUD sparkline reads.
+        trend::record(mem_psi.some.avg10);
+
+        // ── ACTUATE (reactive): the pressure ladder ───────────────────────────
+        match level {
+            psi::PressureLevel::Critical => {
+                self.normal_streak = 0;
+                // Closed loop: pause the biggest freezable hog, then — if freezing
+                // is spent or swap is nearly full — SIGKILL the worst background
+                // hog rather than let the climb reach the kernel's blind global
+                // OOM killer (which took down the whole session on 2026-07-14).
+                // kill_worst self-gates, so calling it every critical tick is safe.
+                // Bias the kernel's global OOM killer toward the hogs FIRST. rtux
+                // cannot intercept a global OOM at all, so if this climb is going to
+                // end in one anyway, the kernel must already be holding a menu of
+                // resumable background sessions rather than `systemd --user`.
+                self.mitigator.bias_oom_toward_hogs();
+                self.mitigator.escalate();
+                self.mitigator.kill_worst();
+                let apps = ranker::rank_apps().unwrap_or_default();
+                self.notifier.maybe_notify(level, &apps);
+            }
+            psi::PressureLevel::Elevated => {
+                self.normal_streak = 0;
+                // Gently throttle the biggest hog first (reversible, low-stall),
+                // nudge the user if a lot of Claude sessions have piled up, and
+                // warn. Freezes/kills are held back until Critical.
+                // Bias early: the OOM ranking must already be right BEFORE a climb
+                // turns critical, since a global OOM gives no warning and no say.
+                self.mitigator.bias_oom_toward_hogs();
+                self.mitigator.throttle();
+                self.mitigator.advise_claude_sessions();
+                let apps = ranker::rank_apps().unwrap_or_default();
+                self.notifier.maybe_notify(level, &apps);
+            }
+            psi::PressureLevel::Normal => {
+                // Hysteresis: only thaw after pressure has stayed normal for a
+                // sustained stretch, so a brief dip doesn't thaw an app straight
+                // back into the pressure that got it frozen (see the const).
+                self.normal_streak = self.normal_streak.saturating_add(1);
+                if self.normal_streak >= RECOVER_AFTER_NORMAL_SECS {
+                    self.mitigator.recover();
+                }
+            }
+        }
+
+        // NOTE: there is deliberately no reactive CPU rung here, and re-adding one
+        // would be a regression. A previous version demoted background hogs'
+        // cpu.weight whenever CPU PSI crossed a threshold, on the theory that
+        // saturated cores are "exactly what makes typing lag". Measurement on
+        // 2026-07-14, during a real ~19s keyboard stall, says otherwise:
+        //
+        //     cpu PSI some.avg10 =  2.28     <-- cores essentially idle
+        //     io  PSI some.avg10 = 34.82     <-- the actual stall
+        //
+        // Typing lagged because the input method was on a disk swapfile, so every
+        // keypress took a major fault. The cores were never the problem, and the
+        // throttle demoted a dozen background apps for nothing.
+        //
+        // It could not have worked anyway. cgroup v2's four resource models are
+        // Weights / Limits / Protections / Allocations, and `cpu.weight` is a
+        // Weight: a share of `w_i / Σ w_active`, where the denominator floats with
+        // whatever else is runnable. There is no `cpu.min` — cgroup v2 cannot
+        // express a CPU *floor* at all, so no arrangement of weights guarantees the
+        // compositor anything. What survives is the standing, class-driven weight
+        // boost applied in guard.rs (Guaranteed's session.slice above app.slice,
+        // the Focused leaf above its siblings): cheap, work-conserving, honest
+        // about being a preference rather than a guarantee, and — unlike this loop
+        // — not pretending to be a floor. That is the whole CPU effector, by design.
+    }
+}
+
 fn run_daemon() -> Result<()> {
     // Auto-reap fire-and-forget children (notify-send, HUD launches) so this
     // long-lived daemon never accumulates zombie processes.
@@ -162,129 +308,18 @@ fn run_daemon() -> Result<()> {
     // exists (e.g. at boot, pre-login), the compositor cgroup isn't there yet —
     // so we keep retrying in the loop until protection actually lands.
     println!("pressured: protecting critical services...");
-    let mut announced: HashSet<String> = HashSet::new();
-    protect_and_report(true, &mut announced);
+    let mut daemon = Daemon::new();
+    protect_and_report(true, &mut daemon.announced);
 
     // Control socket for the HUD / `ctl` client.
     ipc::spawn_server();
 
-    // Monitor + mitigate loop
+    // The reconcile loop: observe → classify → actuate, once a second. All the
+    // standing state lives in `Daemon`; the body of a turn is `Daemon::reconcile`.
     println!("pressured: monitoring PSI (poll 1s, Ctrl+C to stop)...");
-    let mut notifier = notify::Notifier::new();
-    let mut mitigator = mitigate::Mitigator::new();
-    // The instrument. Constructed here so its first tick seeds counters rather
-    // than reporting every spine cgroup's lifetime total as one second of harm.
-    let mut meter = health::FaultMeter::new();
     let poll_interval = Duration::from_secs(1);
-    let mut ticks: u64 = 0;
-    let mut normal_streak: u32 = 0;
-
     loop {
-        ticks += 1;
-        // Re-assert spine protection every 30s — ALWAYS, not just until the first
-        // success. Protection is not a one-shot: memory.min lives on the cgroup,
-        // but oom_score_adj is per-PROCESS and only ever applied to the pids alive
-        // at the time. A service restart, and above all a re-login (which builds a
-        // whole new session tree), leaves the new processes unprotected forever,
-        // because the old `!protected` guard latched true after the first success
-        // and never ran again. Measured after the 2026-07-14 logout: the session's
-        // dbus and pipewire were sitting at +200 — the daemon believed the spine
-        // was protected while the kernel saw it as prime OOM meat. Re-applying is
-        // idempotent and cheap; `announced` keeps the journal quiet.
-        if ticks % 30 == 0 {
-            protect_and_report(false, &mut announced);
-            // Re-enumerate on the same cadence and for the same reason: a re-login
-            // builds a new session tree, and a meter holding the dead session's
-            // paths would report a flatlined-because-gone spine as a healthy one.
-            meter.refresh_spine();
-        }
-
-        // Sample the spine's fault rate BEFORE reading PSI and deciding what to
-        // do. This is the outcome metric — whether the interactive path is waiting
-        // on disk right now — and it is measured unconditionally, at every
-        // pressure level, because the harm we care about does not announce itself
-        // via PSI first. The 19s stall ran at cpu PSI 2.28 and memory PSI that no
-        // threshold here would have called critical; what it did have was the
-        // input method faulting on every keypress. That is what this counts.
-        meter.tick();
-
-        let mem_psi = match psi::read_psi("/proc/pressure/memory") {
-            Ok(r) => r,
-            Err(e) => {
-                // A transient read hiccup must not take the protector down.
-                eprintln!("warning: reading memory PSI failed ({}); retrying", e);
-                thread::sleep(poll_interval);
-                continue;
-            }
-        };
-        let level = psi::classify_pressure(&mem_psi);
-        // Feed the rolling pressure history the HUD sparkline reads.
-        trend::record(mem_psi.some.avg10);
-
-        match level {
-            psi::PressureLevel::Critical => {
-                normal_streak = 0;
-                // Closed loop: pause the biggest freezable hog, then — if freezing
-                // is spent or swap is nearly full — SIGKILL the worst background
-                // hog rather than let the climb reach the kernel's blind global
-                // OOM killer (which took down the whole session on 2026-07-14).
-                // kill_worst self-gates, so calling it every critical tick is safe.
-                // Bias the kernel's global OOM killer toward the hogs FIRST. rtux
-                // cannot intercept a global OOM at all, so if this climb is going to
-                // end in one anyway, the kernel must already be holding a menu of
-                // resumable background sessions rather than `systemd --user`.
-                mitigator.bias_oom_toward_hogs();
-                mitigator.escalate();
-                mitigator.kill_worst();
-                let apps = ranker::rank_apps().unwrap_or_default();
-                notifier.maybe_notify(level, &apps);
-            }
-            psi::PressureLevel::Elevated => {
-                normal_streak = 0;
-                // Gently throttle the biggest hog first (reversible, low-stall),
-                // nudge the user if a lot of Claude sessions have piled up, and
-                // warn. Freezes/kills are held back until Critical.
-                // Bias early: the OOM ranking must already be right BEFORE a climb
-                // turns critical, since a global OOM gives no warning and no say.
-                mitigator.bias_oom_toward_hogs();
-                mitigator.throttle();
-                mitigator.advise_claude_sessions();
-                let apps = ranker::rank_apps().unwrap_or_default();
-                notifier.maybe_notify(level, &apps);
-            }
-            psi::PressureLevel::Normal => {
-                // Hysteresis: only thaw after pressure has stayed normal for a
-                // sustained stretch, so a brief dip doesn't thaw an app straight
-                // back into the pressure that got it frozen (see the const).
-                normal_streak = normal_streak.saturating_add(1);
-                if normal_streak >= RECOVER_AFTER_NORMAL_SECS {
-                    mitigator.recover();
-                }
-            }
-        }
-
-        // NOTE: there is deliberately no reactive CPU rung here, and re-adding one
-        // would be a regression. A previous version demoted background hogs'
-        // cpu.weight whenever CPU PSI crossed a threshold, on the theory that
-        // saturated cores are "exactly what makes typing lag". Measurement on
-        // 2026-07-14, during a real ~19s keyboard stall, says otherwise:
-        //
-        //     cpu PSI some.avg10 =  2.28     <-- cores essentially idle
-        //     io  PSI some.avg10 = 34.82     <-- the actual stall
-        //
-        // Typing lagged because the input method was on a disk swapfile, so every
-        // keypress took a major fault. The cores were never the problem, and the
-        // throttle demoted a dozen background apps for nothing.
-        //
-        // It could not have worked anyway. cgroup v2's four resource models are
-        // Weights / Limits / Protections / Allocations, and `cpu.weight` is a
-        // Weight: a share of `w_i / Σ w_active`, where the denominator floats with
-        // whatever else is runnable. There is no `cpu.min` — cgroup v2 cannot
-        // express a CPU *floor* at all, so no arrangement of weights guarantees the
-        // compositor anything. What survives is the standing weight boost applied
-        // once in guard.rs (session.slice above app.slice, focused app above its
-        // siblings): cheap, work-conserving, honest about being a preference rather
-        // than a guarantee, and — unlike this loop — not pretending to be a floor.
+        daemon.reconcile();
         thread::sleep(poll_interval);
     }
 }
