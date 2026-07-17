@@ -566,7 +566,10 @@ substitute for keeping the spine resident.
 ## Levers not yet pulled
 
 *These are now the phases of the controller above.* Phase 1 extracts the classifier
-(behaviour-identical); phase 2 introduces the reconcile loop and the CPU effector;
+(behaviour-identical) — **done 2026-07-16**: `src/classify.rs` now owns the `Class`
+model and a pure `classify()`, and both the daemon (`mitigate::denied`) and the HUD
+(`ipc`) read class from it instead of each hand-rolling the spine/focus predicates
+that diverged into the July HUD bug. Phase 2 introduces the reconcile loop and the CPU effector;
 phase 3 is the per-session memory limit (#1 below); phase 4 plugs IO behind the
 delegation spike; phase 5 is the judgment tier. Ranked by how much of the *felt* gap
 each one closes — the distance between "rtux

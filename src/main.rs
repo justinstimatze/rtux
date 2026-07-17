@@ -1,5 +1,6 @@
 mod actions;
 mod cgroup;
+mod classify;
 mod cli;
 mod events;
 mod guard;
