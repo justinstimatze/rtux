@@ -514,22 +514,40 @@ system load is correct, and measured.
 
 **The lever exists in the kernel and is switched off for user apps.** cgroup v2's io
 controller is available at the root and enabled for `system.slice`, but the chain to
-user apps drops it:
+user apps drops it. Traced live on rukh (systemd 259):
 
     <root>            subtree_control: cpuset cpu io memory pids
-    user.slice        subtree_control: cpu memory pids      <-- io dropped HERE
-    user@1000.service controllers:     cpu memory pids       (can't see io)
-    app.slice         controllers:     cpu memory pids       (no io.latency to set)
+    user.slice        controllers:     cpuset cpu io memory pids  <-- io is available here…
+    user.slice        subtree_control: cpu memory pids            <-- …but not passed down
+    user-1000.slice   controllers:     cpu memory pids             (io gone)
+    user@1000.service DelegateControllers: cpu memory pids         <-- the hard wall
+    app.slice         controllers:     cpu memory pids             (no io.latency to set)
 
-So `system.slice` services already have IO control and *your apps do not*. The plug
-is a delegation change, not a missing feature: enable `IOAccounting=yes` down
-`user.slice → user-1000.slice → user@1000.service` (system systemd) and on
-`app.slice` (user systemd) — the io controller then reaches the app scopes. It spans
-the system/user systemd boundary, which is the one place the plan touches something
-that could disturb a live session, so it is proven reversibly by
-`scripts/io-delegation-spike.sh` (all `--runtime`, self-reverting, reboot-clears)
-before the installer does it persistently, gated on a capability check. Boxes where
-the spike fails treat IO as capability-detected and simply skip that effector.
+So `system.slice` services already have IO control and *your apps do not*. The
+decisive wall is the last line: `user@1000.service` runs with `Delegate=pids memory
+cpu` (the Ubuntu vendor default, `/usr/lib/systemd/system/user@.service:28`), so the
+per-user `systemd --user` instance is *structurally forbidden* from managing io on
+anything it owns, `app.slice` included. This is why the first spike failed the way it
+did: it reached for `IOAccounting=yes`, but you cannot account for a controller you
+were never delegated — the accounting knob was the wrong lever entirely.
+
+The right lever is `Delegate=`. A one-line drop-in on `user@.service` —
+
+    [Service]
+    Delegate=pids memory cpu io cpuset
+
+— adds io to the delegated set, and systemd then enables io in the subtree_control of
+every ancestor up the chain so it can be handed down. (`cpuset` rides along for free
+and the CPU-idle effector wants it too.) rtux already ships a drop-in in exactly this
+directory — `50-pressured-oomd.conf` — so the delegation override sits right beside it.
+The one caveat is that `user@1000.service`'s cgroup subtree is realised at login, so
+the change lands for sessions started *after* a `daemon-reload` — a next-login step,
+not a live re-delegation (re-delegating a running session would mean restarting
+`user@1000.service`, which tears the session down). `scripts/io-delegation-spike.sh`
+writes the drop-in to `/run` (runtime, reboot-clears), reloads, confirms `user@.service`
+now reports `io cpuset` in its delegated set, then reverts — proving systemd accepts
+the config without touching the live session. Boxes where io still can't be delegated
+treat IO as capability-detected and simply skip that effector.
 
 **The honest limit:** `io.latency` cannot rescue a fault already in flight — that is a
 residency problem `memory.min` already owns. What it protects is the fault *stream*
