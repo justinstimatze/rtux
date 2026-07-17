@@ -195,6 +195,41 @@ rtux stands on — and deliberately departs from — existing work:
   [framing](https://en.wikipedia.org/wiki/Calm_technology) is the north star for
   the ambient/peripheral UX direction.
 
+### QoS-class lineage (the controller's ancestors)
+
+The unified controller is not a new idea; it is the desktop retrofit of a design
+three other ecosystems already ship. Each *declares* the class; rtux must infer it.
+
+- **macOS / Darwin QoS classes** — user-interactive → user-initiated → utility →
+  background, driving CPU priority, core placement, and (via App Nap) background
+  disk/network-IO throttling and timer coalescing. The closest match to "protect the
+  focused workload across CPU+IO," but cooperative — apps declare their class.
+  [Apple: App Nap](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/AppNap.html),
+  [eclecticlight: macOS QoS](https://eclecticlight.co/2022/01/07/how-macos-controls-performance-qos-on-intel-and-m1-processors/).
+- **Android top-app cpuset** — the visible app gets its own fast core plus a ~10%
+  schedtune boost; background is packed onto the slow cores. Focus-following in
+  shipped, billion-device form, built from the same cgroup primitives rtux uses —
+  but Android's framework *knows* the foreground app.
+  [AOSP: performance management](https://source.android.com/docs/core/power/performance),
+  [LWN: scheduling for Android](https://lwn.net/Articles/706374/).
+- **Windows MMCSS** — reserves a percentage of CPU for background work
+  (`SystemResponsiveness`), i.e. a userspace CPU *floor* where cgroup v2 has none —
+  and the cautionary tale: too rigid a reservation *causes* the audio glitch it was
+  meant to prevent. Keeps rtux's floors adaptive.
+  [Microsoft: MMCSS](https://learn.microsoft.com/en-us/windows/win32/procthread/multimedia-class-scheduler-service).
+- **BeOS pervasive multithreading** — the responsiveness legend, and the instructive
+  *mis*-match: it made everything responsive by making threads cheap (one per
+  window), not by deciding who loses under scarcity. It has no memory-overcommit
+  story; rtux lives in the regime BeOS's approach runs out in.
+  [OSnews](https://www.osnews.com/story/180/making-the-case-for-beoss-pervasive-multithreading/),
+  [LWN](https://lwn.net/Articles/495229/).
+- **Kubernetes QoS** — Guaranteed / Burstable / BestEffort, per-workload requests and
+  limits, admission control, pressure eviction by class. The cloud vocabulary rtux's
+  design maps onto one-for-one — except the two assumptions that don't survive a
+  desktop: workloads are fungible/replaceable (yours hold irreplaceable state) and
+  scaling is horizontal (there are no replicas; the reversible *pause* is the
+  substitute for stateless eviction, and it is the better tool).
+
 ## Standing guarantees, not reactive rungs
 
 The organizing principle, arrived at the hard way (see the postmortem below). A
@@ -356,9 +391,160 @@ Corollary for reviewers: a comment stating the intent is not the intent. The
 top-consumer marker's own comment read *"so the top-consumer marker never promises a
 pause that won't come"* directly above the line that broke that promise.
 
+## The controller: one QoS loop, not a bag of reflexes
+
+*Architecture-of-record, adopted 2026-07-16. The levers below become its phases.*
+
+Every lever rtux has — the `memory.min` floor, `cgroup.freeze`, the `cpu.weight`
+boost, `pressured admit` — is a facet of one thing rtux has never named: a
+**single-node QoS controller**. The desktop is a datacenter of one node; each app
+is a workload; the kernel already ships every sensor and actuator (PSI, per-cgroup
+`memory.current`, `memory.min`/`.high`, `cpu.weight`, `io.latency`, `cgroup.freeze`)
+and then stops — on purpose — because the missing piece is *policy*, and policy needs
+to know what the human cares about, which the kernel refuses to guess. rtux is that
+missing policy layer. In Kubernetes terms it is not the workload; it is the
+**scheduler and the kubelet**.
+
+The reason this keeps feeling like "basic cloud shit that should already exist" is
+that it does exist — three times over — just not on the Linux desktop:
+
+- **Kubernetes** QoS classes: Guaranteed / Burstable / BestEffort, with per-workload
+  *requests* (floors) and *limits* (caps), an admission controller that refuses pods
+  that don't fit, and pressure eviction by class.
+- **macOS / Darwin** QoS classes: user-interactive → user-initiated → utility →
+  background, driving CPU priority, P-core vs E-core placement, and — via App Nap —
+  disk- and network-IO throttling and timer coalescing for background apps.
+- **Android** cpusets: the visible app goes in `top-app` (its own fast core + a
+  ~10% schedtune boost); background is *packed* onto the slow cores.
+
+They are the same design wearing three uniforms: **an explicit priority class per
+workload, plus a controller that reserves for the top class and throttles the rest
+across resources.** And each got to *assume* the class — pods declare requests, Apple
+apps declare QoS, Android owns the activity lifecycle. **The Linux desktop has no app
+model that declares anything**, so rtux's genuinely novel, hard part is *inferring*
+the class without app cooperation. Focus is the one class signal observable from
+outside the app — which is why "protect the focused workload" is not one option among
+many; it is the only objective the environment lets us sense.
+
+### The class model
+
+Four classes, named by the precedents above, ordered by claim on the machine:
+
+- **Guaranteed** — the spine (compositor, input method, audio, WM, the daemon).
+  Hard `memory.min`, top `cpu.weight`, never evicted. Structural, from the `SPINE`
+  table.
+- **Focused** — the workload the user is interacting with right now (the focused
+  window's cgroup, and terminals touched in the last few seconds). A `memory.min`
+  bump, a `cpu.weight` boost, IO-latency protection, and immunity from eviction
+  *while focused*. This is Android's `top-app`, inferred instead of declared.
+- **Active** — app.slice members doing work but not focused. Under the ceiling,
+  throttled and frozen under pressure, ordered worst-first.
+- **Idle** — swapped-out background sessions and unattended services. `cpu.idle`,
+  squeezed first, the source of reclaimed headroom.
+
+### The classifier: fast tier + judgment tier
+
+Assigning the class is the heart of the controller, and it splits the way "why is my
+machine out of memory?" splits when a human asks it — a fast glance plus a considered
+stance on what actually matters:
+
+- **Fast tier** — a pure `classify(observation) -> Class`, every tick, in-process,
+  microseconds. Inputs are all cheap: spine-membership, the focused cgroup (from the
+  extension), touched-recently, `comm`/cgroup name, `memory.current`, fault rate.
+  This is `spared_now` + the spine table generalised into a classifier. Deterministic
+  and dependable — a root daemon's hot path must never block.
+- **Judgment tier** — the considered stance, run out-of-band and *cached*. It assigns
+  priors by workload identity ("a browser tab is more restorable than a video call",
+  "a Claude session mid-thought is Active-not-Idle, freezing it destroys work",
+  "ollama serving nobody is pure Idle"). Heuristic ruleset now; could be model-
+  assisted later. It runs on first sight of an unknown app or on a slow timer, never
+  on the tick, and writes verdicts the fast tier reads. A missing verdict falls back
+  to structural class — the fast tier is never gated on it. (Same discipline as the
+  API-cache rule: deterministic fast path, expensive judgment cached off the hot
+  path.)
+
+### The actuator map — three resources, three different strengths
+
+The honest part the prior art forces: the three resources do **not** actuate with
+equal strength, and pretending they do is the MMCSS mistake (a floor too rigid
+becomes the glitch it was meant to prevent).
+
+| Resource | Guaranteed / Focused | Active / Idle | Guarantee strength |
+|---|---|---|---|
+| Memory | `memory.min` (hard floor) | `memory.high` (adaptive cap) | **hard** — the floor is real |
+| CPU | `cpu.weight` boost, `cpu.uclamp.min` | `cpu.idle`, `cpu.max` on the *complement* | **reserved headroom** — no `cpu.min` exists; the floor is faked by capping everyone else (MMCSS's `SystemResponsiveness`) |
+| IO | `io.latency` target | `io.max` / `io.weight` throttle | **throughput fairness** — helps the fault *stream*, not a single fault in flight |
+
+The CPU floor is the one genuine *kernel* gap: cgroup v2 has no `cpu.min`, so a hard
+CPU guarantee is inexpressible. It is plugged in userspace by ceiling the Active+Idle
+complement and demoting Idle to `cpu.idle`, which reserves headroom for Focused
+without a kernel patch — coarse, but sufficient, and exactly what Windows does.
+
+### The reconcile loop
+
+One loop replaces the two independent ones (per-tick mitigate + 30s protect). Each
+tick: **observe** (PSI mem/cpu/io, per-cgroup current+swap, fault rate, focused
+cgroup) → **classify** (fast tier, falling back through the judgment cache) →
+**actuate** (drive the effectors per the map). The existing modules become organs:
+`guard` → the memory/CPU request effector; `mitigate` → the eviction effector (its
+`spared_now` moves *into the classifier*, since "expendable" is a class question — the
+exact confusion behind the July HUD bug); `health` → the sensor feeding the objective;
+`admit` → reads the *same* class/headroom model, so admission and runtime control
+finally agree instead of each computing headroom their own way.
+
+## IO is a first-class load, and the lever is switched off
+
+*The finding that promoted IO from a footnote to a phase, measured 2026-07-16.*
+
+rtux's worst incidents — 19s keyboard latency, a 40s wake-from-lock — were **IO**
+events wearing a memory costume. A major fault is a block read from the swap device;
+`memory.min` prevents the eviction, but for the pages that *do* leave, nothing today
+protects the fault-back-in latency, and that is pure IO. On rukh the swap chain is
+zram (prio 100, compressed RAM, no block IO) spilling to `/swapfile` and the LVM swap
+on the NVMe — so every swap page beyond zram is a block-IO event on the same device
+the compositor faults through.
+
+And IO is the *dominant active stall source* on this box right now — not memory:
+
+    root io.pressure    some avg60=0.69  full avg60=0.59   (~71 min cumulative since boot)
+    root memory PSI      some avg10=0.03
+
+IO PSI runs ~10–20× the memory PSI. The instinct that IO is under-appreciated as a
+system load is correct, and measured.
+
+**The lever exists in the kernel and is switched off for user apps.** cgroup v2's io
+controller is available at the root and enabled for `system.slice`, but the chain to
+user apps drops it:
+
+    <root>            subtree_control: cpuset cpu io memory pids
+    user.slice        subtree_control: cpu memory pids      <-- io dropped HERE
+    user@1000.service controllers:     cpu memory pids       (can't see io)
+    app.slice         controllers:     cpu memory pids       (no io.latency to set)
+
+So `system.slice` services already have IO control and *your apps do not*. The plug
+is a delegation change, not a missing feature: enable `IOAccounting=yes` down
+`user.slice → user-1000.slice → user@1000.service` (system systemd) and on
+`app.slice` (user systemd) — the io controller then reaches the app scopes. It spans
+the system/user systemd boundary, which is the one place the plan touches something
+that could disturb a live session, so it is proven reversibly by
+`scripts/io-delegation-spike.sh` (all `--runtime`, self-reverting, reboot-clears)
+before the installer does it persistently, gated on a capability check. Boxes where
+the spike fails treat IO as capability-detected and simply skip that effector.
+
+**The honest limit:** `io.latency` cannot rescue a fault already in flight — that is a
+residency problem `memory.min` already owns. What it protects is the fault *stream*
+during recovery — waking from lock is thousands of faults, a sustained IO burst where
+`io.latency` prioritises the compositor's reads over a background job's writes. So IO
+control is a real new guarantee for contention and recovery, and explicitly *not* a
+substitute for keeping the spine resident.
+
 ## Levers not yet pulled
 
-Ranked by how much of the *felt* gap each one closes — the distance between "rtux
+*These are now the phases of the controller above.* Phase 1 extracts the classifier
+(behaviour-identical); phase 2 introduces the reconcile loop and the CPU effector;
+phase 3 is the per-session memory limit (#1 below); phase 4 plugs IO behind the
+delegation spike; phase 5 is the judgment tier. Ranked by how much of the *felt* gap
+each one closes — the distance between "rtux
 reacted correctly" and "the machine felt powerful," which the 21:31 incident proved
 are different things. Recorded 2026-07-14; re-ranked 2026-07-15 against 22h of
 evidence; **re-ranked again 2026-07-16 after v0.3.0, which shipped the old top two
