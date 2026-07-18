@@ -579,8 +579,17 @@ memory limit (#1 below) — **done 2026-07-17**: `guard::cap_active_sessions` pu
 `memory.high` of `app_ceiling/3` (~3.7GB here) on every Active app scope above 512MB,
 Focused-exempt (lifted the instant you focus it), so no one session grows into the whole
 app budget. It subsumed the reactive `throttle()` rung, which is retired (one writer on
-per-app `memory.high`, a leading indicator instead of a lagging one). Phase 4 plugs IO behind the
-delegation spike; phase 5 is the judgment tier. Ranked by how much of the *felt* gap
+per-app `memory.high`, a leading indicator instead of a lagging one). Phase 4 plugs IO
+behind the delegation spike — **held 2026-07-17**: io is still not delegated to `app.slice`
+(the `Delegate=` drop-in needs a re-login), so rather than build an inert effector blind,
+phase 4 waits until the spike is confirmed and the lever can be measured. Phase 5 is the
+judgment tier — **measure-first cut done 2026-07-17**: `src/judgment.rs` holds the cached
+stance. Its deterministic half, `Restorability`, drives kill-victim ordering now (the
+extensible home for the old `is_claude` rule). Its thresholded half — CPU quiescence — is
+sampled and *logged only* (`ActivityMeter`, on the reconcile cadence), driving nothing, so
+the Idle threshold is earned from data the way the fault threshold was (20 cried wolf, 100
+was measured). The Idle class and its actuation (`cpu.idle`, squeezed-first) land once that
+data is in — a follow-up, not a phase. Ranked by how much of the *felt* gap
 each one closes — the distance between "rtux
 reacted correctly" and "the machine felt powerful," which the 21:31 incident proved
 are different things. Recorded 2026-07-14; re-ranked 2026-07-15 against 22h of

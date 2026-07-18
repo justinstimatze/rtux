@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::classify;
 use crate::guard::format_bytes;
+use crate::judgment::{self, Restorability};
 use crate::{actions, cgroup, guard, notify};
 
 /// Summon the HUD to the foreground. Wayland only grants focus to a *fresh*
@@ -10,15 +11,15 @@ use crate::{actions, cgroup, guard, notify};
 /// jumps to the front. Mirrored in `setup-hotkey.sh` and the GNOME extension.
 pub const SUMMON_HUD: &str = "pkill -KILL -x pressured-hud; for i in $(seq 50); do pgrep -x pressured-hud >/dev/null || break; sleep 0.02; done; pressured-hud";
 
-/// Choose the kill victim's index from `is_claude` flags in largest-first order.
-/// Policy (B→C→A): prefer the largest *non-Claude* hog (a browser dies before a
-/// Claude session); only if there are none, take the largest Claude session.
-/// Returns None for an empty list.
-fn pick_victim_index(is_claude: &[bool]) -> Option<usize> {
-    is_claude
-        .iter()
-        .position(|&c| !c)
-        .or_else(|| is_claude.iter().position(|&c| c))
+/// Choose the kill victim's index from the candidates' restorability, in
+/// largest-first order. Policy: take the largest `Ordinary` hog (a browser dies
+/// before a Claude session); only if none remain, the largest `Precious` one. The
+/// identity prior itself now lives in `judgment::restorability` — this just orders
+/// by it. Returns None for an empty list.
+fn pick_victim_index(rest: &[Restorability]) -> Option<usize> {
+    rest.iter()
+        .position(|&r| r == Restorability::Ordinary)
+        .or_else(|| rest.iter().position(|&r| r == Restorability::Precious))
 }
 
 /// The name to show in a notification / activity trail for a cgroup. Terminal
@@ -49,17 +50,18 @@ mod tests {
     // decision that is genuinely the eviction effector's own: victim ranking.
 
     #[test]
-    fn victim_ranking_prefers_non_claude_then_largest_first() {
+    fn victim_ranking_prefers_ordinary_then_largest_first() {
+        use Restorability::{Ordinary as O, Precious as P};
         // Empty → nothing to kill.
         assert_eq!(pick_victim_index(&[]), None);
-        // Only Claude sessions → the largest (index 0, largest-first) is chosen.
-        assert_eq!(pick_victim_index(&[true, true, true]), Some(0));
-        // A non-Claude hog wins even when a larger Claude session precedes it.
-        assert_eq!(pick_victim_index(&[true, false, true]), Some(1));
-        // Largest non-Claude wins when several exist.
-        assert_eq!(pick_victim_index(&[false, true, false]), Some(0));
-        // Single Claude session → it's the victim (last resort, witnessed).
-        assert_eq!(pick_victim_index(&[true]), Some(0));
+        // Only Precious (Claude) sessions → the largest (index 0) is the last resort.
+        assert_eq!(pick_victim_index(&[P, P, P]), Some(0));
+        // An Ordinary hog dies even when a larger Precious session precedes it.
+        assert_eq!(pick_victim_index(&[P, O, P]), Some(1));
+        // Largest Ordinary wins when several exist.
+        assert_eq!(pick_victim_index(&[O, P, O]), Some(0));
+        // A single Precious session is the victim only as the last resort, witnessed.
+        assert_eq!(pick_victim_index(&[P]), Some(0));
     }
 }
 
@@ -344,8 +346,9 @@ impl Mitigator {
             Err(_) => return,
         };
         // Build the eligible set (largest-first, past the size floor, not exempt,
-        // not the foreground, not already killed), labelling Claude sessions.
-        let mut eligible: Vec<(PathBuf, String, u64, bool)> = Vec::new();
+        // not the foreground, not already killed), tagging each with the judgment
+        // tier's restorability so the least-precious dies first.
+        let mut eligible: Vec<(PathBuf, String, u64, Restorability)> = Vec::new();
         for (path, name, mem) in candidates {
             if mem < MIN_KILL_BYTES {
                 break; // sorted largest-first — nothing bigger remains
@@ -353,16 +356,17 @@ impl Mitigator {
             if self.denied(&name, &path) || self.killed.iter().any(|p| p == &path) {
                 continue;
             }
-            match cgroup::claude_session_label(&path) {
-                Some(label) => eligible.push((path, label, mem, true)),
-                None => eligible.push((path, name, mem, false)),
-            }
+            let rest = judgment::restorability(&path);
+            // A Precious (Claude) scope carries its rich session label so a kill
+            // names it; everything else keeps its plain app name.
+            let label = cgroup::claude_session_label(&path).unwrap_or(name);
+            eligible.push((path, label, mem, rest));
         }
-        let flags: Vec<bool> = eligible.iter().map(|e| e.3).collect();
-        let Some(idx) = pick_victim_index(&flags) else {
+        let ranks: Vec<Restorability> = eligible.iter().map(|e| e.3).collect();
+        let Some(idx) = pick_victim_index(&ranks) else {
             return; // nothing eligible to kill
         };
-        let (path, label, mem, is_claude) = eligible.swap_remove(idx);
+        let (path, label, mem, rest) = eligible.swap_remove(idx);
         match actions::kill_cgroup(&path) {
             Ok(_) => {
                 // Record the swap level that justified crossing the kill gate
@@ -371,7 +375,7 @@ impl Mitigator {
                 let swap_pct = cgroup::swap_used_fraction() * 100.0;
                 eprintln!("killed {} ({}) at swap {:.0}%", label, format_bytes(mem), swap_pct);
                 crate::events::record(format!("Killed {} (swap {:.0}%)", label, swap_pct));
-                let tail = if is_claude {
+                let tail = if rest == Restorability::Precious {
                     " You can restart this Claude session."
                 } else {
                     ""

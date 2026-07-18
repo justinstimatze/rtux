@@ -69,6 +69,20 @@ pub fn read_memory_stat_field(cgroup_path: &Path, field: &str) -> Option<u64> {
     })
 }
 
+/// `usage_usec` out of `cpu.stat` — total CPU time (microseconds, summed across
+/// cores) this cgroup has ever consumed. Monotonic, so utilisation is a *delta*
+/// over a window, never the raw total (the same d/dt discipline as the fault
+/// meter). Same `key value` line format as `memory.stat`. None if absent — the
+/// cpu controller may not be enabled here, or the cgroup may have vanished
+/// mid-sample, both normal on a timer.
+pub fn read_cpu_usage_usec(cgroup_path: &Path) -> Option<u64> {
+    let content = fs::read_to_string(cgroup_path.join("cpu.stat")).ok()?;
+    content.lines().find_map(|line| {
+        let rest = line.strip_prefix("usage_usec")?.strip_prefix(' ')?;
+        rest.trim().parse::<u64>().ok()
+    })
+}
+
 /// Write a value to a cgroup knob.
 pub fn write_cgroup(cgroup_path: &Path, knob: &str, value: &str) -> Result<()> {
     let path = cgroup_path.join(knob);
