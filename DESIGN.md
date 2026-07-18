@@ -574,7 +574,12 @@ effector — **done 2026-07-16**: the daemon loop is now `Daemon::reconcile()`, 
 observe → classify → actuate turn, and the CPU effector is a single class-keyed policy
 (`guard::cpu_weight_for`) that Guaranteed/Focused/Active route through. Scoped to *standing,
 work-conserving weights only* — no reactive `cpu.max` ceiling (the tombstone in `main.rs`
-stands), and `cpu.idle` for Idle waits on the idle signal. Phase 3 is the per-session memory limit (#1 below); phase 4 plugs IO behind the
+stands), and `cpu.idle` for Idle waits on the idle signal. Phase 3 is the per-session
+memory limit (#1 below) — **done 2026-07-17**: `guard::cap_active_sessions` puts a standing
+`memory.high` of `app_ceiling/3` (~3.7GB here) on every Active app scope above 512MB,
+Focused-exempt (lifted the instant you focus it), so no one session grows into the whole
+app budget. It subsumed the reactive `throttle()` rung, which is retired (one writer on
+per-app `memory.high`, a leading indicator instead of a lagging one). Phase 4 plugs IO behind the
 delegation spike; phase 5 is the judgment tier. Ranked by how much of the *felt* gap
 each one closes — the distance between "rtux
 reacted correctly" and "the machine felt powerful," which the 21:31 incident proved
@@ -625,6 +630,18 @@ is d/dt, and a total is never a health signal.**
    much* without turning the ceiling's honest denominator back into a vibe. Design,
    not a knob. Unlisted before 2026-07-16 because the evidence to name it only just
    arrived.
+
+   **Built 2026-07-17 (phase 3).** *Which:* every Active app scope above 512MB,
+   uniform, Focused always exempt — the same uniformity as the bulk ceiling, and the
+   exemption keeps the window you're in warm while it thins the rest. *How much:*
+   `app_ceiling/3` — sized against the app ceiling (not raw RAM) so it rides the
+   honest denominator rather than reintroducing a vibe; ~3.7GB here, so a normal
+   ~1GB session never feels it and the 10.2GB monopolist is bounded hard. Standing,
+   re-asserted on the reconcile cadence, released the instant a scope is focused
+   (`guard::cap_active_sessions` + an immediate lift in `protect_foreground`). This
+   retired the reactive `throttle()` rung: two writers on per-app `memory.high` is a
+   bug, and a leading-indicator cap that is *always* true is the doctrine the bulk
+   ceiling already set.
 
 2. **Prove focus-following actually spares the window you're in — measure before you
    build.** Half-built already: `spared_now` = foreground OR recently-typed-in, so the
