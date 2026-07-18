@@ -6,6 +6,7 @@ mod events;
 mod guard;
 mod health;
 mod ipc;
+mod judgment;
 mod mitigate;
 mod notify;
 mod psi;
@@ -142,6 +143,10 @@ struct Daemon {
     meter: health::FaultMeter,
     /// Spine services already announced as protected — keeps the 30s re-assert quiet.
     announced: HashSet<String>,
+    /// The judgment tier's observation-only CPU-quiescence sampler (phase 5,
+    /// measure-first): it logs candidate-idle scopes and actuates nothing, so the
+    /// Idle threshold can be earned from data rather than guessed.
+    activity: judgment::ActivityMeter,
     ticks: u64,
     /// Consecutive normal-pressure ticks, for thaw hysteresis (see the const).
     normal_streak: u32,
@@ -154,6 +159,7 @@ impl Daemon {
             mitigator: mitigate::Mitigator::new(),
             meter: health::FaultMeter::new(),
             announced: HashSet::new(),
+            activity: judgment::ActivityMeter::new(),
             ticks: 0,
             normal_streak: 0,
         }
@@ -186,6 +192,10 @@ impl Daemon {
             // 30s cadence catches it long before it can monopolise. Focused scopes
             // are released; see guard::cap_active_sessions.
             guard::cap_active_sessions();
+            // Judgment tier, measure-first: sample per-scope CPU quiescence and log
+            // candidate-idle scopes. Observation only — it drives no actuation; it
+            // exists to earn the Idle threshold from real data (see judgment.rs).
+            self.activity.observe(30);
             // Re-enumerate on the same cadence and for the same reason: a re-login
             // builds a new session tree, and a meter holding the dead session's
             // paths would report a flatlined-because-gone spine as a healthy one.
