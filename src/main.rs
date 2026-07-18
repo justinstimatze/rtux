@@ -179,6 +179,13 @@ impl Daemon {
         // `announced` keeps the journal quiet.
         if self.ticks % 30 == 0 {
             protect_and_report(false, &mut self.announced);
+            // The per-session standing cap: no single Active app grows into the
+            // whole app budget and forces the rest into the freeze path. Leading
+            // indicator, re-asserted here for the same reason as the floors — a
+            // re-login rebuilds app.slice, and a session grows over minutes, so a
+            // 30s cadence catches it long before it can monopolise. Focused scopes
+            // are released; see guard::cap_active_sessions.
+            guard::cap_active_sessions();
             // Re-enumerate on the same cadence and for the same reason: a re-login
             // builds a new session tree, and a meter holding the dead session's
             // paths would report a flatlined-because-gone spine as a healthy one.
@@ -229,13 +236,14 @@ impl Daemon {
             }
             psi::PressureLevel::Elevated => {
                 self.normal_streak = 0;
-                // Gently throttle the biggest hog first (reversible, low-stall),
-                // nudge the user if a lot of Claude sessions have piled up, and
-                // warn. Freezes/kills are held back until Critical.
-                // Bias early: the OOM ranking must already be right BEFORE a climb
-                // turns critical, since a global OOM gives no warning and no say.
+                // Memory bounding is no longer reactive here: the per-session cap
+                // (standing, above) already holds every Active session inside its
+                // share of the ceiling, so there is no "throttle the biggest hog"
+                // rung to fire — a leading indicator subsumes the lagging one. What
+                // Elevated still does is bias the global OOM ranking early (a global
+                // OOM gives no warning and no say, so it must be right BEFORE the
+                // climb turns critical) and nudge the user to close some sessions.
                 self.mitigator.bias_oom_toward_hogs();
-                self.mitigator.throttle();
                 self.mitigator.advise_claude_sessions();
                 let apps = ranker::rank_apps().unwrap_or_default();
                 self.notifier.maybe_notify(level, &apps);

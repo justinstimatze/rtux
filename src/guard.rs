@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use crate::cgroup;
-use crate::classify::Class;
+use crate::classify::{self, Class};
 
 const CGROUP_BASE: &str = "/sys/fs/cgroup";
 
@@ -892,6 +892,65 @@ fn app_slice_high(total_ram: u64) -> u64 {
     total_ram.saturating_sub(desktop_reserve(total_ram))
 }
 
+/// Only scopes above this get a per-session cap — small apps are never the
+/// monopolizer and writing to thousands of tiny scopes is pointless. (Also the
+/// `list_apps` filter, so the cap loop never even sees them.)
+const PER_SESSION_CAP_MIN_SCOPE: u64 = 512 * 1024 * 1024; // 512 MB
+/// Never size the per-session cap below this, however small the machine — a normal
+/// session's footprint, so a session on a tiny box still gets room to exist.
+const PER_SESSION_HIGH_FLOOR: u64 = 1024 * 1024 * 1024; // 1 GB
+
+/// The per-session ceiling: a third of what all apps collectively may hold. Sized
+/// against the *app* ceiling (not raw RAM) so it tracks the honest denominator the
+/// bulk ceiling already established. On a 14.8GB box that is ~3.7GB — roughly 3-4×
+/// a normal session, so it never bites normal use and three sessions can coexist;
+/// a monopolist that reached 90% of the ceiling (the 11:57 incident, one session at
+/// 10.2GB) is bounded to ~3.7GB. Floored so a tiny machine still gives a session
+/// room rather than a cap tighter than a session needs to breathe.
+fn per_session_high(total_ram: u64) -> u64 {
+    (app_slice_high(total_ram) / 3).max(PER_SESSION_HIGH_FLOOR)
+}
+
+/// The per-session standing cap — the leading-indicator floor *inside* the bulk
+/// ceiling. `set_bulk_ceiling` stops all apps *together* from taking the machine;
+/// this stops any *one* Active app from growing into the whole app budget and
+/// forcing the rest (including your other working sessions) into the freeze path.
+/// It is the memory half of the Active class's effector.
+///
+/// `memory.high` (throttle-into-reclaim, never a kill) on each Active app scope,
+/// sized by `per_session_high`. **Focused is exempt** — the window you are in is
+/// never capped; that exemption is the whole point ("keep what you're looking at
+/// warm while thinning the rest"). The spine is Guaranteed and isn't in app.slice,
+/// so it is never reached here regardless.
+///
+/// Applied on the reconcile cadence (not just under pressure): the bound is *always
+/// true*, the same doctrine as the bulk ceiling — you cannot react your way to
+/// "no session ever monopolises". The cap is a ceiling, so on a scope below it the
+/// write is a harmless no-op until the scope grows past it. Fully reversible: a
+/// scope that becomes Focused (or the daemon stopping) writes `max` back.
+pub fn cap_active_sessions() {
+    let Ok(total_ram) = cgroup::total_ram_bytes() else {
+        return;
+    };
+    let cap = per_session_high(total_ram);
+    for app in cgroup::list_apps(PER_SESSION_CAP_MIN_SCOPE) {
+        let class = classify::classify(&classify::observe(&app.name, &app.raw, &app.path));
+        match class {
+            // Active (and Idle, once it exists) — bound it. The write is idempotent
+            // and a no-op until the scope actually exceeds the cap.
+            Class::Active | Class::Idle => {
+                let _ = crate::actions::cap_cgroup(&app.path, cap);
+            }
+            // Focused — release any cap a prior pass set; you're using this now.
+            // Guaranteed can't appear here (not an app.slice member) but is handled
+            // for totality.
+            Class::Focused | Class::Guaranteed => {
+                let _ = crate::actions::uncap_cgroup(&app.path);
+            }
+        }
+    }
+}
+
 /// Put a standing ceiling on bulk app memory. Written ONCE at startup — not in
 /// response to pressure — because that is the entire point.
 ///
@@ -1284,6 +1343,10 @@ pub fn protect_foreground(cgroup_path: &std::path::Path) -> Result<()> {
     // spine; the foreground path never did, so rtux was actively marking the
     // window you work in for death while reporting it as protected.
     set_oom_score_adj(cgroup_path, OOM_SCORE_ADJ_PROTECT);
+    // Lift any standing per-session cap immediately: the window you just switched
+    // to must be uncapped now, not on the next 30s reconcile. (The reconcile pass
+    // re-applies the cap once focus leaves and it falls back to Active.)
+    let _ = crate::actions::uncap_cgroup(cgroup_path);
     // CPU: favour the focused app among its slice siblings — the scheduler dual
     // of the memory pin, and the Focused tier of the CPU effector. unprotect_cgroup
     // drops it back to the Active default on focus change.
@@ -1360,6 +1423,32 @@ mod tests {
         // a no-op dressed as a preference.
         assert!(cpu_weight_for(Class::Focused) > cpu_weight_for(Class::Active));
         assert!(cpu_weight_for(Class::Guaranteed) > cpu_weight_for(Class::Active));
+    }
+
+    /// The per-session cap sizing: a third of the app ceiling, floored. Pins the two
+    /// properties that keep it honest — it never bites a normal ~1GB session (so it
+    /// isn't a thrash engine), and it does bound the 10.2GB monopolist that named
+    /// this phase.
+    #[test]
+    fn per_session_cap_bounds_the_monopolist_but_spares_a_normal_session() {
+        use super::{app_slice_high, per_session_high, PER_SESSION_HIGH_FLOOR};
+        const GB: u64 = 1024 * 1024 * 1024;
+
+        // rukh: 14.8GB. app ceiling ~11GB, so the cap is ~3.7GB.
+        let ram = 14_800 * 1024 * 1024;
+        let cap = per_session_high(ram);
+        assert_eq!(cap, app_slice_high(ram) / 3, "cap tracks the app ceiling, not raw RAM");
+        assert!(cap > 3 * GB && cap < 4 * GB, "~3.7GB on this machine, got {cap}");
+        // A normal session (~1GB) is far under the cap — memory.high never bites it.
+        assert!(cap > 3 * GB, "a normal session must sit well below the cap");
+        // The 10.2GB monopolist is bounded hard.
+        assert!(cap < 4 * GB, "the 10.2GB session is capped to a fraction of the ceiling");
+
+        // Tiny box: the floor keeps the cap from strangling a session that needs to
+        // exist at all. 4GB RAM → app ceiling 2GB → /3 = 0.67GB, floored to 1GB.
+        let tiny = 4 * GB;
+        assert_eq!(per_session_high(tiny), PER_SESSION_HIGH_FLOOR);
+        assert!(per_session_high(tiny) >= PER_SESSION_HIGH_FLOOR);
     }
 }
 

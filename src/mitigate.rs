@@ -74,8 +74,6 @@ pub const MIN_FREEZE_BYTES: u64 = 512 * 1024 * 1024; // 512 MB
 /// a dozen background Claude sessions, 3 was far too low: it froze 3, then culled
 /// the rest. The foreground is always spared, so freezing broadly is safe.
 const MAX_FROZEN: usize = 24;
-/// Cap how many cgroups we'll throttle (memory.high) at the Elevated tier.
-const MAX_THROTTLED: usize = 3;
 /// Don't SIGKILL anything smaller than this — same floor as freezing.
 const MIN_KILL_BYTES: u64 = 512 * 1024 * 1024; // 512 MB
 /// Cap how many cgroups we'll SIGKILL in one pressure episode — a backstop so a
@@ -84,13 +82,6 @@ const MAX_KILLED: usize = 3;
 /// Swap-used fraction at which reclaim-to-zram is futile (nowhere left to move
 /// pages) and we jump straight to the kill rung, even before freezing is spent.
 const SWAP_HIGH_WATER: f64 = 0.85;
-/// No single background cgroup may hold more than 1/N of RAM resident once we're
-/// throttling it. An absolute, machine-relative ceiling — the whole point is that
-/// it does NOT scale with the target's appetite (see the throttle call site).
-const BULK_RESIDENT_DIVISOR: u64 = 4;
-/// Never throttle below this, however over-budget a hog is — a cap this tight is
-/// already deep reclaim, and going lower just thrashes it to no benefit.
-const MIN_THROTTLE_FLOOR: u64 = 256 * 1024 * 1024;
 /// Stop forcing memory.reclaim once swap is this full. Above it there is nowhere
 /// left to page to, so a forced reclaim only stalls — and can push the kernel over
 /// the edge into a global OOM (see the reclaim call site). Well below
@@ -102,7 +93,6 @@ const SWAP_RECLAIM_CEILING: f64 = 0.70;
 const CLAUDE_SESSION_WARN_COUNT: usize = 4;
 pub struct Mitigator {
     frozen: Vec<(PathBuf, String)>,
-    throttled: Vec<(PathBuf, String)>,
     /// Cgroups we've SIGKILLed this episode. Kept only for the per-episode cap
     /// and to skip re-killing — a kill is not reversible, so recover() never
     /// touches these beyond clearing the list.
@@ -119,7 +109,6 @@ impl Mitigator {
     pub fn new() -> Self {
         Self {
             frozen: Vec::new(),
-            throttled: Vec::new(),
             killed: Vec::new(),
             advised: false,
             oom_biased: Vec::new(),
@@ -156,68 +145,6 @@ impl Mitigator {
             if !self.oom_biased.iter().any(|p| p == &path) {
                 self.oom_biased.push(path);
             }
-        }
-    }
-
-    /// Elevated pressure: gently throttle the largest freezable consumer via
-    /// memory.high (forces it to reclaim its own cold pages and slows its
-    /// allocation) — one per call, before we ever resort to freezing.
-    pub fn throttle(&mut self) {
-        if self.throttled.len() >= MAX_THROTTLED {
-            return;
-        }
-        let candidates = match cgroup::list_freezable_cgroups() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        for (path, name, mem) in candidates {
-            if mem < MIN_FREEZE_BYTES {
-                break;
-            }
-            if self.denied(&name, &path) {
-                continue;
-            }
-            if self.throttled.iter().any(|(p, _)| &path == p)
-                || self.frozen.iter().any(|(p, _)| &path == p)
-            {
-                continue;
-            }
-            // Clamp to what the MACHINE can hold — never to 90% of the hog's own
-            // appetite.
-            //
-            // `mem / 10 * 9` is relative to the target, so the cap scales WITH the
-            // thing it is supposed to restrain: the bigger a runaway grows, the
-            // bigger an allowance it earns. On 2026-07-14 that produced the log
-            // line "throttled claude · madrid to 20.2GB" — on a 14.8GB machine.
-            // A memory.high above physical RAM is a no-op the daemon recorded as a
-            // successful intervention, and the session died 50 minutes later.
-            //
-            // memory.high is the right lever (the kernel's own docs call it "the
-            // main mechanism to control memory usage": it throttles allocation into
-            // direct reclaim and never invokes the OOM killer, so an over-eager cap
-            // costs the hog latency, not its life). It was only ever pointed at the
-            // wrong number. Take the tighter of "back off a little" and "fit in the
-            // machine", so a hog can be squeezed gently but can never negotiate
-            // itself a ceiling the box cannot honour.
-            let machine_cap = cgroup::total_ram_bytes()
-                .map(|t| t / BULK_RESIDENT_DIVISOR)
-                .unwrap_or(u64::MAX);
-            let high = (mem / 10 * 9)
-                .min(machine_cap)
-                .max(MIN_THROTTLE_FLOOR);
-            match actions::cap_cgroup(&path, high) {
-                Ok(_) => {
-                    let disp = display_name(&path, &name);
-                    eprintln!("throttled {} to {}", disp, format_bytes(high));
-                    crate::events::record(format!("Eased off {}", disp));
-                    self.throttled.push((path, disp));
-                }
-                Err(e) => {
-                    eprintln!("failed to throttle {}: {}", path.display(), e);
-                    continue;
-                }
-            }
-            return; // one per tick
         }
     }
 
@@ -507,8 +434,11 @@ impl Mitigator {
         }
     }
 
-    /// Pressure back to normal: undo everything this episode — thaw frozen apps
-    /// and release throttles.
+    /// Pressure back to normal: undo the episode's *eviction* — thaw frozen apps
+    /// and drop the OOM bias. The per-session memory caps are NOT touched here:
+    /// they are a standing bound (guard::cap_active_sessions), released when a scope
+    /// becomes Focused, not when a pressure episode ends. An episode is over; the
+    /// rule that no background session monopolises is always on.
     pub fn recover(&mut self) {
         // Reset the per-episode kill cap and the advisory debounce. Kills are not
         // reversible, so there is nothing to undo — just start the next episode
@@ -521,17 +451,6 @@ impl Mitigator {
         // only the session to kill.
         for path in std::mem::take(&mut self.oom_biased) {
             guard::unbias_hog_oom(&path);
-        }
-
-        // Release throttles (memory.high = max). Record it so the trail closes the
-        // ledger — an "Eased off X" with no matching release is a half-story.
-        for (path, name) in std::mem::take(&mut self.throttled) {
-            if let Err(e) = actions::uncap_cgroup(&path) {
-                eprintln!("failed to un-throttle {}: {}", path.display(), e);
-            } else {
-                eprintln!("un-throttled {}", name);
-                crate::events::record(format!("Released {}", name));
-            }
         }
 
         if self.frozen.is_empty() {
