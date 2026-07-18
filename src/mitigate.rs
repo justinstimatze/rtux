@@ -5,12 +5,6 @@ use crate::guard::format_bytes;
 use crate::judgment::{self, Restorability};
 use crate::{actions, cgroup, guard, notify};
 
-/// Summon the HUD to the foreground. Wayland only grants focus to a *fresh*
-/// client, so we SIGKILL any running HUD (instant death frees the D-Bus name
-/// before the relaunch can race it) and spawn a new process, which reliably
-/// jumps to the front. Mirrored in `setup-hotkey.sh` and the GNOME extension.
-pub const SUMMON_HUD: &str = "pkill -KILL -x pressured-hud; for i in $(seq 50); do pgrep -x pressured-hud >/dev/null || break; sleep 0.02; done; pressured-hud";
-
 /// Choose the kill victim's index from the candidates' restorability, in
 /// largest-first order. Policy: take the largest `Ordinary` hog (a browser dies
 /// before a Claude session); only if none remain, the largest `Precious` one. The
@@ -253,59 +247,29 @@ impl Mitigator {
                         let after = crate::cgroup::read_cgroup_u64(&p, "memory.current")
                             .unwrap_or(before);
                         let reclaimed = before.saturating_sub(after);
-                        let significant = reclaimed > 64 * 1024 * 1024;
-                        let body = if significant {
-                            // Say "paged out", not "moved to compressed RAM": zram is
-                            // only the FIRST swap device. Once it fills (it was
-                            // 6.5/7.4GB full during the 2026-07-14 outage) everything
-                            // overflows to the on-disk swapfile — so the cheerful
-                            // "compressed RAM" line was describing gigabytes of disk
-                            // writes, which is exactly what stalled the desktop it
-                            // claimed to be protecting. Don't promise a destination we
-                            // haven't checked.
-                            format!(
-                                "Froze {} ({}) and paged out {} to keep the desktop \
-                                 responsive. Resumes automatically when pressure \
-                                 clears.",
-                                n, sz, format_bytes(reclaimed)
-                            )
-                        } else {
-                            format!(
-                                "Froze {} ({}) to keep the desktop responsive. \
-                                 Resumes automatically when pressure clears.",
-                                n, sz
-                            )
-                        };
-                        if significant {
+                        // Say "paged out", not "moved to compressed RAM": zram is only
+                        // the FIRST swap device. Once it fills (it was 6.5/7.4GB full
+                        // during the 2026-07-14 outage) everything overflows to the
+                        // on-disk swapfile — so the cheerful "compressed RAM" line was
+                        // describing gigabytes of disk writes, which is exactly what
+                        // stalled the desktop it claimed to be protecting.
+                        if reclaimed > 64 * 1024 * 1024 {
+                            eprintln!("paged out {} from {}", format_bytes(reclaimed), n);
                             crate::events::record(format!(
                                 "Paged out {} from {}",
                                 format_bytes(reclaimed),
                                 n
                             ));
                         }
-                        match notify::notify_action(
-                            "normal",
-                            "Paused a memory hog",
-                            &body,
-                            &[("resume", "Resume now"), ("open", "Open rtux")],
-                        )
-                        .as_deref()
-                        {
-                            Some("resume") => {
-                                let _ = actions::thaw_cgroup(&p);
-                            }
-                            Some("open") => {
-                                // New-client-per-summon: Wayland only focuses a
-                                // fresh client, so kill any running HUD and spawn
-                                // a new process (see setup-hotkey.sh).
-                                let _ = std::process::Command::new("sh")
-                                    .args(["-c", SUMMON_HUD])
-                                    .spawn();
-                            }
-                            _ => {}
-                        }
                     });
+                    // A freeze is reversible and, when it works, invisible — so it is
+                    // NOT a toast (that stream buried the one notice that matters, a
+                    // kill). It lives in the journal, in `ctl history`, and in the
+                    // tray/HUD's ambient state; focusing the window thaws it on the
+                    // spot (guard::protect_foreground). Toasts are reserved for the
+                    // one destructive, irreversible event: kill_worst.
                     let disp = display_name(&path, &name);
+                    eprintln!("froze {} ({})", disp, sz);
                     crate::events::record(format!("Paused {}", disp));
                     self.frozen.push((path, disp));
                 }
@@ -420,15 +384,14 @@ impl Mitigator {
         }
         if count >= CLAUDE_SESSION_WARN_COUNT {
             if !self.advised {
-                notify::notify_session(
-                    "normal",
-                    "A lot of Claude sessions are open",
-                    &format!(
-                        "{} Claude sessions are using {} — closing a few will keep the \
-                         machine from running low.",
-                        count,
-                        format_bytes(total)
-                    ),
+                // Advisory, not an action rtux took — and the user has asked not to
+                // be toasted for routine operation. Journal only (debounced by
+                // `advised` so it says it once per accumulation), for whoever reads
+                // the log; no popup.
+                eprintln!(
+                    "{} Claude sessions using {} — closing a few would ease pressure",
+                    count,
+                    format_bytes(total)
                 );
                 self.advised = true;
             }
@@ -468,10 +431,9 @@ impl Mitigator {
                 crate::events::record(format!("Resumed {}", name));
             }
         }
-        notify::notify_session(
-            "normal",
-            "Memory pressure cleared",
-            &format!("Resumed {} paused app(s).", count),
-        );
+        // No toast on recovery either — the return to normal is the good case, and
+        // the per-app "thawed"/"Resumed" lines above already record it. Reserve the
+        // interruption budget for the one bad, irreversible outcome: a kill.
+        eprintln!("pressure cleared — resumed {} paused app(s)", count);
     }
 }
