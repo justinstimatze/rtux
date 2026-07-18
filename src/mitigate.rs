@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::classify;
 use crate::guard::format_bytes;
@@ -14,6 +16,23 @@ fn pick_victim_index(rest: &[Restorability]) -> Option<usize> {
     rest.iter()
         .position(|&r| r == Restorability::Ordinary)
         .or_else(|| rest.iter().position(|&r| r == Restorability::Precious))
+}
+
+/// Choose the freeze victim's index from `(cpu_activity, size_bytes)` pairs: least
+/// CPU-active first (fraction of one core), largest as the tiebreak so among
+/// equally-quiescent apps the one freeing the most memory wins. Unknown activity is
+/// passed as `f64::INFINITY` by the caller, so an unmeasurable cgroup is frozen only
+/// when nothing measurable remains. Returns None for an empty slice.
+fn pick_freeze_index(ranked: &[(f64, u64)]) -> Option<usize> {
+    ranked
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.1.cmp(&a.1))
+        })
+        .map(|(i, _)| i)
 }
 
 /// The name to show in a notification / activity trail for a cgroup. Terminal
@@ -57,6 +76,24 @@ mod tests {
         // A single Precious session is the victim only as the last resort, witnessed.
         assert_eq!(pick_victim_index(&[P]), Some(0));
     }
+
+    #[test]
+    fn freeze_targets_the_idlest_then_the_largest() {
+        // (cpu activity as fraction-of-core, size bytes).
+        // A busy 4GB app vs an idle 800MB one → freeze the idle one, felt-invisible,
+        // even though it frees less: pausing a session mid-work is the worst outcome.
+        assert_eq!(pick_freeze_index(&[(0.9, 4_000), (0.01, 800)]), Some(1));
+        // Among equally-quiescent apps, the largest yields the most memory.
+        assert_eq!(pick_freeze_index(&[(0.0, 800), (0.0, 4_000), (0.0, 2_000)]), Some(1));
+        // An episode's first tick: no prior CPU samples, so all unknown (INFINITY) —
+        // degrade cleanly to the old largest-first behaviour.
+        let inf = f64::INFINITY;
+        assert_eq!(pick_freeze_index(&[(inf, 800), (inf, 4_000)]), Some(1));
+        // A measurable idle app is preferred over an unmeasurable (unknown) one.
+        assert_eq!(pick_freeze_index(&[(inf, 9_000), (0.2, 800)]), Some(1));
+        // Empty → nothing to freeze.
+        assert_eq!(pick_freeze_index(&[]), None);
+    }
 }
 
 /// Don't bother freezing anything smaller than this — the churn isn't worth it.
@@ -98,6 +135,11 @@ pub struct Mitigator {
     /// Hogs whose oom_score_adj we've raised so a global OOM eats them instead of
     /// the session — returned to neutral on recover().
     oom_biased: Vec<PathBuf>,
+    /// Last-seen cpu.stat usage_usec per candidate + when, so escalate() can rank
+    /// freeze targets by recent CPU activity. Kept across episodes on purpose: a
+    /// long gap since the last sample just yields a longer-window average, the
+    /// "idle for a while" signal we want on an episode's first freeze.
+    cpu_seen: HashMap<PathBuf, (u64, Instant)>,
     self_cgroup: Option<PathBuf>,
 }
 
@@ -108,6 +150,7 @@ impl Mitigator {
             killed: Vec::new(),
             advised: false,
             oom_biased: Vec::new(),
+            cpu_seen: HashMap::new(),
             self_cgroup: cgroup::self_cgroup(),
         }
     }
@@ -176,9 +219,10 @@ impl Mitigator {
         classify::classify(&classify::observe(name, &raw, path)).protected_from_eviction()
     }
 
-    /// Critical pressure: freeze the single largest freezable consumer.
-    /// One freeze per call (the daemon calls this each poll tick), so the system
-    /// gets a beat to recover after each pause before we escalate further.
+    /// Critical pressure: pause one big freezable consumer — the *idlest* one, not
+    /// merely the largest. Freezing a session mid-response is the worst felt outcome;
+    /// an idle background one is invisible. One freeze per call (the daemon calls this
+    /// each poll tick), so the system gets a beat to recover before we escalate again.
     pub fn escalate(&mut self) {
         if self.frozen.len() >= MAX_FROZEN {
             return;
@@ -187,6 +231,10 @@ impl Mitigator {
             Ok(c) => c,
             Err(_) => return,
         };
+
+        // Eligible: big enough to be worth it, not protected, not already
+        // (nested-)frozen, and actually freezable.
+        let mut eligible: Vec<(PathBuf, String, u64)> = Vec::new();
         for (path, name, mem) in candidates {
             if mem < MIN_FREEZE_BYTES {
                 break; // sorted largest-first — nothing bigger remains
@@ -205,10 +253,38 @@ impl Mitigator {
             if !path.join("cgroup.freeze").exists() {
                 continue;
             }
+            eligible.push((path, name, mem));
+        }
+
+        // Idle-biased ordering: among the eligible, freeze the one using the least
+        // CPU right now, largest-first as the tiebreak so equally-quiescent apps
+        // still yield the most memory. An *ordering*, not an Idle threshold (that
+        // calibrated cutoff is the measure-first phase-5 follow-up): freeze is
+        // reversible and one-per-tick, so a slightly-off pick self-corrects on the
+        // next tick. Unmeasurable cgroups sort last (INFINITY). On an episode's first
+        // tick nothing has a prior CPU sample, so every activity is unknown and this
+        // degrades cleanly to the old largest-first behaviour.
+        let now = Instant::now();
+        let mut ranked: Vec<(f64, PathBuf, String, u64)> = eligible
+            .into_iter()
+            .map(|(path, name, mem)| {
+                let act = self.cpu_activity(&path, now).unwrap_or(f64::INFINITY);
+                (act, path, name, mem)
+            })
+            .collect();
+
+        // Try the idlest first; on a freeze error fall through to the next-idlest.
+        while !ranked.is_empty() {
+            let view: Vec<(f64, u64)> = ranked.iter().map(|(a, _, _, m)| (*a, *m)).collect();
+            let Some(idx) = pick_freeze_index(&view) else {
+                return;
+            };
+            let (_act, path, name, mem) = ranked.swap_remove(idx);
             match actions::freeze_cgroup(&path) {
                 Ok(_) => {
-                    // Actionable, calm notification off the main loop: a click on
-                    // "Resume now" thaws exactly this app; "Open rtux" raises the HUD.
+                    // Reclaim runs off the main loop: memory.reclaim can block, and
+                    // the daemon must keep reconciling. The freeze itself already
+                    // stopped the growth synchronously above.
                     let p = path.clone();
                     let n = display_name(&path, &name);
                     let sz = format_bytes(mem);
@@ -272,14 +348,33 @@ impl Mitigator {
                     eprintln!("froze {} ({})", disp, sz);
                     crate::events::record(format!("Paused {}", disp));
                     self.frozen.push((path, disp));
+                    return; // one freeze per tick
                 }
                 Err(e) => {
                     eprintln!("failed to freeze {}: {}", path.display(), e);
-                    continue;
+                    // The idlest was unfreezable; fall through to the next-idlest so
+                    // one wedged cgroup can't stall the rung or spam the log.
                 }
             }
-            return; // one freeze per tick
         }
+    }
+
+    /// Recent CPU use of a cgroup as a fraction of one core, measured since we last
+    /// looked and updating the snapshot in place. `None` on first sight (no prior
+    /// sample to diff against) or when cpu.stat is unreadable — the caller treats
+    /// that as "unknown, freeze only as a last resort". During a critical episode
+    /// escalate() runs every second, so samples sit ~1s apart; across episodes the
+    /// gap widens into a longer-window average, which is exactly the "has this been
+    /// idle for a while" signal we want on the first freeze of a new episode.
+    fn cpu_activity(&mut self, path: &Path, now: Instant) -> Option<f64> {
+        let usage = cgroup::read_cpu_usage_usec(path)?;
+        let (prev_usage, prev_at) = self.cpu_seen.insert(path.to_path_buf(), (usage, now))?;
+        let elapsed = now.duration_since(prev_at).as_secs_f64();
+        if elapsed <= 0.0 {
+            return None;
+        }
+        let delta_usec = usage.saturating_sub(prev_usage) as f64;
+        Some(delta_usec / 1_000_000.0 / elapsed)
     }
 
     /// The last rung before the kernel's own global OOM killer. When freezing is
