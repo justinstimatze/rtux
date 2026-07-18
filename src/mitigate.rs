@@ -356,10 +356,9 @@ impl Mitigator {
             if self.denied(&name, &path) || self.killed.iter().any(|p| p == &path) {
                 continue;
             }
-            let rest = judgment::restorability(&path);
-            // A Precious (Claude) scope carries its rich session label so a kill
-            // names it; everything else keeps its plain app name.
-            let label = cgroup::claude_session_label(&path).unwrap_or(name);
+            // One identity read yields both the rank and the display label, so a
+            // mid-kill process-set change can't make them disagree.
+            let (rest, label) = judgment::assess(&path, name);
             eligible.push((path, label, mem, rest));
         }
         let ranks: Vec<Restorability> = eligible.iter().map(|e| e.3).collect();

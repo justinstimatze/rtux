@@ -361,6 +361,34 @@ fn do_pin_self(pid: Option<i32>) -> ActReply {
 
 // The app currently favoured as foreground (its memory.min is raised).
 static FOREGROUND: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+// Cgroups whose memory.high a user set by hand via `ctl cap`/`ctl uncap`. The
+// standing per-session cap (guard::cap_active_sessions, re-asserted every 30s)
+// skips these, so it never silently reverts an explicit override: a user who
+// squeezed a hog tighter, or freed a long-running background job to run unbounded,
+// keeps that choice until the scope ends or the daemon restarts. A Vec (not a
+// HashSet) so it can be a const-initialised static like FOREGROUND — the set is
+// tiny (only hand-issued actions land here), so linear membership is free.
+static USER_CAPPED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Record that a user set this cgroup's memory.high by hand, so the standing cap
+/// leaves it alone. Idempotent.
+pub fn mark_user_capped(path: &std::path::Path) {
+    let mut v = USER_CAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    if !v.iter().any(|p| p.as_path() == path) {
+        v.push(path.to_path_buf());
+    }
+}
+
+/// True if a user has manually capped/uncapped this cgroup — the standing
+/// per-session cap must not overwrite their choice.
+pub fn is_user_capped(path: &std::path::Path) -> bool {
+    USER_CAPPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|p| p.as_path() == path)
+}
 // The focused *window's* pid (the terminal emulator, for a terminal). The
 // auto-mitigator uses it to spare the active terminal and all its tabs from
 // freeze/kill — their processes descend from this pid (see pid_descends_from).
@@ -614,6 +642,11 @@ fn do_act(action: &str, id: &str) -> ActReply {
     };
     match res {
         Ok(msg) => {
+            // A hand-issued cap/uncap is an explicit override: mark it so the 30s
+            // standing per-session cap doesn't silently revert it next reconcile.
+            if matches!(action, "cap" | "uncap") {
+                mark_user_capped(&path);
+            }
             crate::events::record(msg.clone());
             ActReply { ok: true, msg }
         }
