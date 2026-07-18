@@ -48,16 +48,24 @@ pub enum Restorability {
     Precious,
 }
 
-/// The identity prior for a cgroup. Deterministic: a Claude session is Precious,
-/// everything else Ordinary. This is the generalised, extensible home for the rule
-/// the eviction effector used to hard-code as a `is_claude` bool — the seam where a
-/// richer stance ("a video call is Precious; a paused download is Ordinary") lands
-/// later without touching the effector.
-pub fn restorability(path: &Path) -> Restorability {
-    if cgroup::claude_session_label(path).is_some() {
-        Restorability::Precious
-    } else {
-        Restorability::Ordinary
+/// The eviction prior AND the display label for a victim, from a SINGLE identity
+/// read. Deterministic: a Claude session is Precious and carries its rich session
+/// label; everything else is Ordinary and keeps its plain `name`.
+///
+/// One read, not two, is load-bearing: `claude_session_label` does live IO
+/// (`/proc/*/comm`, `/proc/*/cwd`), so reading it separately for the rank and for
+/// the label let a mid-kill process-set change make the two disagree — a victim
+/// ranked Precious but shown with a plain name, or the reverse. Assessing both from
+/// one read keeps them consistent, the way the pre-judgment-tier code did.
+///
+/// This is the generalised, extensible home for the rule the eviction effector used
+/// to hard-code as an `is_claude` bool — the seam where a richer stance ("a video
+/// call is Precious; a paused download is Ordinary") lands later without touching
+/// the effector.
+pub fn assess(path: &Path, name: String) -> (Restorability, String) {
+    match cgroup::claude_session_label(path) {
+        Some(label) => (Restorability::Precious, label),
+        None => (Restorability::Ordinary, name),
     }
 }
 
@@ -125,15 +133,16 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// A Claude-session scope is Precious; anything else is Ordinary. (The label
+    /// A non-Claude scope assesses as Ordinary and keeps its plain name — and the
+    /// rank/label come from the same read, so they can't disagree. (Claude
     /// detection itself is `cgroup`'s; here we pin the mapping the effector orders
-    /// by, and that a non-existent/plain path is Ordinary rather than accidentally
-    /// precious.)
+    /// by, and that a plain path is Ordinary rather than accidentally Precious.)
     #[test]
-    fn claude_sessions_are_precious_everything_else_ordinary() {
-        // A path with no claude session marker resolves to Ordinary.
+    fn a_non_claude_scope_assesses_ordinary_and_keeps_its_name() {
         let plain = PathBuf::from("/sys/fs/cgroup/user.slice/.../firefox.scope");
-        assert_eq!(restorability(&plain), Restorability::Ordinary);
+        let (rest, label) = assess(&plain, "Firefox".to_string());
+        assert_eq!(rest, Restorability::Ordinary);
+        assert_eq!(label, "Firefox");
     }
 
     /// The ordering the eviction effector relies on: Ordinary is strictly "evict

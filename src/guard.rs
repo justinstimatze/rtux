@@ -911,6 +911,13 @@ fn per_session_high(total_ram: u64) -> u64 {
     (app_slice_high(total_ram) / 3).max(PER_SESSION_HIGH_FLOOR)
 }
 
+/// True if this cgroup lives under a user `app.slice` — the only place the
+/// per-session cap belongs. `system.slice` members are excluded: they can never be
+/// focused (so the cap could never be released) and the slice holds spine services.
+fn under_app_slice(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "app.slice")
+}
+
 /// The per-session standing cap — the leading-indicator floor *inside* the bulk
 /// ceiling. `set_bulk_ceiling` stops all apps *together* from taking the machine;
 /// this stops any *one* Active app from growing into the whole app budget and
@@ -934,6 +941,22 @@ pub fn cap_active_sessions() {
     };
     let cap = per_session_high(total_ram);
     for app in cgroup::list_apps(PER_SESSION_CAP_MIN_SCOPE) {
+        // Only user app.slice members. `list_apps` also enumerates `system.slice`,
+        // but a system service has no window to focus, so `protect_foreground` —
+        // the only path that lifts this cap — can never fire for it: the cap would
+        // be re-asserted every 30s forever with no release, thrashing a working set
+        // it can't shrink (ollama, a database, a container). And `system.slice`
+        // holds spine members (the system bus); it is explicitly not for a blunt
+        // cap (see DESIGN "system.slice is outside the pen"). Skip anything not
+        // under an app.slice.
+        if !under_app_slice(&app.path) {
+            continue;
+        }
+        // A user who set this scope's memory.high by hand (ctl cap/uncap) has taken
+        // manual control — never silently revert that on the reconcile.
+        if crate::ipc::is_user_capped(&app.path) {
+            continue;
+        }
         let class = classify::classify(&classify::observe(&app.name, &app.raw, &app.path));
         match class {
             // Active (and Idle, once it exists) — bound it. The write is idempotent
@@ -1449,6 +1472,24 @@ mod tests {
         let tiny = 4 * GB;
         assert_eq!(per_session_high(tiny), PER_SESSION_HIGH_FLOOR);
         assert!(per_session_high(tiny) >= PER_SESSION_HIGH_FLOOR);
+    }
+
+    /// The per-session cap must reach user app scopes and NEVER system.slice — a
+    /// system service can't be focused, so a cap on it could never be released and
+    /// would thrash forever. This is the fix for the review's HIGH finding.
+    #[test]
+    fn only_app_slice_scopes_are_cappable() {
+        use super::under_app_slice;
+        use std::path::Path;
+        assert!(under_app_slice(Path::new(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/firefox.scope"
+        )));
+        assert!(under_app_slice(Path::new(
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/tmux-spawn-x.scope"
+        )));
+        // system.slice services must be excluded — ollama, a database, a container.
+        assert!(!under_app_slice(Path::new("/sys/fs/cgroup/system.slice/ollama.service")));
+        assert!(!under_app_slice(Path::new("/sys/fs/cgroup/system.slice/docker.service")));
     }
 }
 
