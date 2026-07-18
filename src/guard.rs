@@ -1351,6 +1351,13 @@ pub fn unprotect_cgroup(cgroup_path: &std::path::Path) -> Result<()> {
 /// never paged out and always instant. Clamped to a fraction of RAM so a huge
 /// foreground app (a big browser) can't reserve the whole machine and starve
 /// everything else — foreground is favoured, not made a black hole.
+/// Thaw the focused window only when it is actually frozen. `cgroup.freeze`
+/// reads `1` when frozen, `0` when running; a missing/unreadable knob (None) is
+/// treated as "not frozen" — never write a thaw blindly.
+fn should_thaw_on_focus(freeze_state: Option<u64>) -> bool {
+    freeze_state == Some(1)
+}
+
 pub fn protect_foreground(cgroup_path: &std::path::Path) -> Result<()> {
     let current = cgroup::read_cgroup_u64(cgroup_path, "memory.current").unwrap_or(0);
     let total = cgroup::total_ram_bytes().unwrap_or(0);
@@ -1370,6 +1377,24 @@ pub fn protect_foreground(cgroup_path: &std::path::Path) -> Result<()> {
     // to must be uncapped now, not on the next 30s reconcile. (The reconcile pass
     // re-applies the cap once focus leaves and it falls back to Active.)
     let _ = crate::actions::uncap_cgroup(cgroup_path);
+    // If an earlier pressure episode froze this window, thaw it NOW — focus is
+    // intent, and an unresponsive focused window is the exact felt-jank rtux
+    // exists to prevent. It's marked Focused above, so it won't be re-frozen; the
+    // reclaim budget comes from something you are NOT looking at on the next tick.
+    // Gated on the frozen state so an ordinary focus-change (the common case)
+    // costs nothing and logs nothing.
+    if should_thaw_on_focus(cgroup::read_cgroup_u64(cgroup_path, "cgroup.freeze").ok()) {
+        match crate::actions::thaw_cgroup(cgroup_path) {
+            Ok(()) => eprintln!(
+                "thawed on focus: {}",
+                cgroup_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| cgroup_path.display().to_string())
+            ),
+            Err(e) => eprintln!("failed to thaw focused {}: {}", cgroup_path.display(), e),
+        }
+    }
     // CPU: favour the focused app among its slice siblings — the scheduler dual
     // of the memory pin, and the Focused tier of the CPU effector. unprotect_cgroup
     // drops it back to the Active default on focus change.
@@ -1751,5 +1776,18 @@ mod spine_class_tests {
         // memory.min=0 with 78% of itself on a disk swapfile. Regression guard.
         let input = SPINE.iter().find(|c| c.name == "input method").expect("no input method class");
         assert!(input.units.iter().any(|u| u.contains("IBus") || u.contains("ibus")));
+    }
+}
+
+#[cfg(test)]
+mod focus_thaw_tests {
+    use super::should_thaw_on_focus;
+
+    #[test]
+    fn thaws_only_a_genuinely_frozen_window() {
+        assert!(should_thaw_on_focus(Some(1)), "cgroup.freeze==1 is frozen — thaw it");
+        assert!(!should_thaw_on_focus(Some(0)), "already running — no needless write");
+        // A cgroup with no freeze knob, or an unreadable one, must not be written to.
+        assert!(!should_thaw_on_focus(None), "absent/unreadable freeze state is not frozen");
     }
 }

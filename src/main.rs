@@ -136,7 +136,6 @@ fn protect_and_report(verbose: bool, announced: &mut HashSet<String>) {
 /// of a fistful of `let mut` locals threaded through the loop — and the seam the
 /// controller's later phases hang off (each becomes a step inside `reconcile`).
 struct Daemon {
-    notifier: notify::Notifier,
     mitigator: mitigate::Mitigator,
     /// The instrument: the spine's major-fault rate, the outcome metric. Seeded at
     /// construction so its first tick reports a delta, not a lifetime scar.
@@ -155,7 +154,6 @@ struct Daemon {
 impl Daemon {
     fn new() -> Self {
         Self {
-            notifier: notify::Notifier::new(),
             mitigator: mitigate::Mitigator::new(),
             meter: health::FaultMeter::new(),
             announced: HashSet::new(),
@@ -241,8 +239,6 @@ impl Daemon {
                 self.mitigator.bias_oom_toward_hogs();
                 self.mitigator.escalate();
                 self.mitigator.kill_worst();
-                let apps = ranker::rank_apps().unwrap_or_default();
-                self.notifier.maybe_notify(level, &apps);
             }
             psi::PressureLevel::Elevated => {
                 self.normal_streak = 0;
@@ -255,8 +251,6 @@ impl Daemon {
                 // climb turns critical) and nudge the user to close some sessions.
                 self.mitigator.bias_oom_toward_hogs();
                 self.mitigator.advise_claude_sessions();
-                let apps = ranker::rank_apps().unwrap_or_default();
-                self.notifier.maybe_notify(level, &apps);
             }
             psi::PressureLevel::Normal => {
                 // Hysteresis: only thaw after pressure has stayed normal for a
