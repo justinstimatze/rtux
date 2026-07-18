@@ -34,6 +34,11 @@ const JUDGMENT_MIN_SCOPE: u64 = 512 * 1024 * 1024; // 512 MB
 /// are trying to measure, so acting on this guess would defeat the point.
 const QUIESCENCE_OBS_FRACTION: f64 = 0.02; // ~2% of one core
 
+/// Emit the full-distribution histogram every Nth sample (~5 min at the 30s
+/// reconcile cadence): often enough to build the bimodal picture over hours, rare
+/// enough to keep the journal light. The per-sample candidate line stays every tick.
+const HISTOGRAM_EVERY: u64 = 10;
+
 /// How costly it is to lose this workload to eviction — the identity prior the
 /// eviction effector orders victims by. Deterministic (no thresholds), so it is
 /// safe to act on today. `Ordinary` is taken before `Precious`.
@@ -71,29 +76,41 @@ pub fn assess(path: &Path, name: String) -> (Restorability, String) {
 
 /// Observation-only CPU-quiescence sampler — the measurement that must come before
 /// the Idle class. It reads each sizeable app scope's `cpu.stat` usage delta over
-/// the judgment window and logs the ones that look idle. It deliberately actuates
-/// **nothing**: no `cpu.idle`, no eviction bias. Its whole job is to put real
-/// idle-vs-active numbers in the journal so the threshold that *would* produce Idle
-/// can be derived from data, the same way the fault threshold was.
+/// the judgment window and records two things: the idle tail (named, every sample)
+/// and, on a slower cadence, a histogram of the *whole* activity distribution. It
+/// deliberately actuates **nothing**: no `cpu.idle`, no eviction bias. Its whole job
+/// is to put real idle-vs-active numbers in the journal so the threshold that
+/// *would* produce Idle can be derived from data, the same way the fault threshold
+/// was.
+///
+/// Why the histogram: the candidate line only ever shows scopes below
+/// `QUIESCENCE_OBS_FRACTION`, i.e. one side of the boundary. The Idle threshold
+/// lives in the *valley* between the idle pile-up and the active tail, which is
+/// invisible unless the active side is recorded too. The histogram is that other
+/// half of the measurement.
 pub struct ActivityMeter {
     /// Last-seen `usage_usec` per scope, for the delta. A scope absent this pass
     /// (ended) simply drops out — the map is rebuilt each sample.
     last_usage: HashMap<PathBuf, u64>,
+    /// Sample counter, so the full-distribution histogram emits on a slower cadence
+    /// (every `HISTOGRAM_EVERY`) than the per-sample candidate line.
+    samples: u64,
 }
 
 impl ActivityMeter {
     pub fn new() -> Self {
-        Self { last_usage: HashMap::new() }
+        Self { last_usage: HashMap::new(), samples: 0 }
     }
 
-    /// Sample utilisation and log candidate-idle scopes. `window_secs` is the
-    /// nominal cadence between calls (the reconcile's 30s). First sight of a scope
-    /// yields no delta, so it is measured from the next pass on. Quiet when nothing
-    /// looks idle.
+    /// Sample utilisation, name the idle tail, and periodically log the full
+    /// distribution. `window_secs` is the nominal cadence between calls (the
+    /// reconcile's 30s). First sight of a scope yields no delta, so it is measured
+    /// from the next pass on. The candidate line is quiet when nothing looks idle.
     pub fn observe(&mut self, window_secs: u64) {
         let window_usec = window_secs.max(1) as f64 * 1_000_000.0;
         let mut fresh: HashMap<PathBuf, u64> = HashMap::new();
         let mut candidates: Vec<(String, f64)> = Vec::new();
+        let mut all_fracs: Vec<f64> = Vec::new();
 
         for app in cgroup::list_apps(JUDGMENT_MIN_SCOPE) {
             let Some(usage) = cgroup::read_cpu_usage_usec(&app.path) else {
@@ -101,13 +118,15 @@ impl ActivityMeter {
             };
             if let Some(&prev) = self.last_usage.get(&app.path) {
                 let frac = usage.saturating_sub(prev) as f64 / window_usec;
+                all_fracs.push(frac);
                 if frac < QUIESCENCE_OBS_FRACTION {
-                    candidates.push((app.name.clone(), frac));
+                    candidates.push((idle_label(&app), frac));
                 }
             }
             fresh.insert(app.path.clone(), usage);
         }
         self.last_usage = fresh;
+        self.samples = self.samples.wrapping_add(1);
 
         if !candidates.is_empty() {
             let list = candidates
@@ -125,6 +144,48 @@ impl ActivityMeter {
                 list, window_secs
             );
         }
+
+        // The other half of the measurement: the full distribution over ALL sizeable
+        // scopes, so the active cluster is on record too and the idle/active valley
+        // becomes findable. Slower cadence to keep the journal light.
+        if self.samples % HISTOGRAM_EVERY == 0 && !all_fracs.is_empty() {
+            let h = activity_histogram(&all_fracs);
+            eprintln!(
+                "activity dist over {}s (n={}): <1%:{} 1-2%:{} 2-5%:{} 5-10%:{} \
+                 10-25%:{} 25-50%:{} >=50%:{} [Idle threshold unmeasured — the cutoff \
+                 is the valley between the idle pile-up and the active tail]",
+                window_secs,
+                all_fracs.len(),
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6]
+            );
+        }
+    }
+}
+
+/// Bucket activity fractions (of one core) into fixed bins, fine near the low end
+/// where the Idle threshold will fall: `<1, 1-2, 2-5, 5-10, 10-25, 25-50, >=50 %`.
+/// Half-open `[lo, hi)`, so exactly 1% lands in the 1-2% bin. Deltas are computed
+/// from a saturating subtraction, so a fraction is never negative; a multi-core
+/// scope (>1.0) lands in the top bin.
+fn activity_histogram(fracs: &[f64]) -> [usize; 7] {
+    const EDGES: [f64; 6] = [0.01, 0.02, 0.05, 0.10, 0.25, 0.50];
+    let mut bins = [0usize; 7];
+    for &f in fracs {
+        let idx = EDGES.iter().position(|&e| f < e).unwrap_or(EDGES.len());
+        bins[idx] += 1;
+    }
+    bins
+}
+
+/// Readable label for a candidate-idle scope: a terminal child (a vte/tmux spawn)
+/// resolves to its rich session label — "claude · dir" — instead of the generic
+/// "Terminal (child)"; everything else keeps its humanized name. Mirrors the
+/// eviction path's `display_name`, so the journal reads the same as the kill witness.
+fn idle_label(app: &cgroup::AppInfo) -> String {
+    if app.raw.starts_with("vte-spawn") || app.raw.starts_with("tmux-spawn") {
+        cgroup::proc_label(&app.path).unwrap_or_else(|| app.name.clone())
+    } else {
+        app.name.clone()
     }
 }
 
@@ -154,5 +215,25 @@ mod tests {
         // effector's own ranking test (mitigate) exercises the selection; this pins
         // the two-tier intent at the source of truth.
         assert_ne!(Restorability::Ordinary, Restorability::Precious);
+    }
+
+    #[test]
+    fn histogram_records_both_the_idle_pileup_and_the_active_tail() {
+        // An idle cluster (<1% and 1-2%), a gap, then an active tail — the shape the
+        // Idle threshold is derived from. The old candidate line could see only the
+        // first two bins; this sees all of it.
+        let fracs = [0.001, 0.008, 0.015, 0.012, 0.30, 1.2];
+        assert_eq!(activity_histogram(&fracs), [2, 2, 0, 0, 0, 1, 1]);
+        //                                      <1 1-2 2-5 5-10 10-25 25-50 >=50
+    }
+
+    #[test]
+    fn histogram_boundaries_are_half_open() {
+        // Exactly-on-edge values fall into the upper bin: 1% -> 1-2%, 50% -> >=50%.
+        assert_eq!(
+            activity_histogram(&[0.01, 0.02, 0.05, 0.10, 0.25, 0.50]),
+            [0, 1, 1, 1, 1, 1, 1]
+        );
+        assert_eq!(activity_histogram(&[]), [0; 7]);
     }
 }
