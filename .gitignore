@@ -1,2 +1,5 @@
 /target
 .plancheck-debug.json
+
+# Editor/clipboard scratch — stray screenshot pastes land here as untracked junk.
+Pasted image*.png
