@@ -5,6 +5,36 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Changed
+- **Toasts are reserved for kills.** On a machine that lives at the memory limit,
+  the freeze notice fired on every freeze — a nine-app episode was nine popups —
+  burying the one notice that matters. Freeze, pressure-rising, recovery, and the
+  too-many-sessions advisory no longer toast at all; they live in the journal, in
+  `ctl history`, and in the tray/HUD's ambient state (none of which Do-Not-Disturb
+  suppresses — closes gh #1 by construction). The one surviving toast is a **kill**:
+  destructive, irreversible, `critical` urgency so it shows under DND. With the
+  freeze notice gone, its whole actionable-notification path — `notify_action` plus
+  the dbus-monitor `ActionInvoked` parser — was dead and is removed (net −289 lines).
+- **The eviction rung freezes the *idlest* big consumer, not merely the largest.**
+  It ranked by size alone, so on a box running many Claude sessions it grabbed the
+  user's working set — pausing a session mid-response is the worst felt outcome.
+  `escalate()` now orders eligible scopes by a recent `cpu.stat` activity delta
+  (`pick_freeze_index`) and pauses the idlest, size as the tiebreak. An ordering,
+  not an Idle threshold (that calibrated cutoff is still the measure-first
+  follow-up), so it's safe ahead of the measurement and degrades to largest-first on
+  an episode's first tick.
+
+### Added
+- **Focus thaws.** Focusing a window rtux had frozen now unfreezes it immediately
+  (`guard::protect_foreground`), rather than waiting for pressure to clear and the
+  thaw hysteresis to elapse. Focus is intent; an unresponsive focused window is the
+  exact jank rtux exists to prevent.
+- **The quiescence instrument measures the whole distribution.** It had logged only
+  the idle tail (scopes under the 2% gate), which can never reveal the idle/active
+  valley the Idle threshold lives in. `ActivityMeter::observe` now also emits a
+  histogram over all sizeable scopes (every ~5 min), and candidate labels resolve to
+  the rich `claude · dir` instead of a generic `Terminal (child)`.
+
 ## [0.3.0] — measured, not guessed
 
 Every number rtux acted on used to be a guess, and on 2026-07-15 the guesses were

@@ -136,9 +136,19 @@ background. So the attention model must be gentler and always overridable.
 ## Calm UX: never demand acknowledgement
 
 A notification you must dismiss is a small betrayal of the whole thesis — it
-*interrupts* to tell you the machine is handling things. So rtux's notifications
-are transient and auto-expiring (normal urgency, `transient` hint): they fade on
-their own. You never acknowledge anything.
+*interrupts* to tell you the machine is handling things. So as of 2026-07-17 the
+reversible, routine interventions — freeze, pressure-rising, recovery, the
+too-many-sessions advisory — **no longer toast at all**: they live in the journal,
+in `ctl history`, and in the tray/HUD's ambient state, none of which interrupts and
+none of which Do-Not-Disturb can suppress (the DND-legibility hole, gh #1, closes
+by construction — there is no toast left to be suppressed). On a machine that lives
+at the memory limit these fired constantly; a freeze toast on every freeze buried
+the one notice that matters.
+
+The single deliberate exception is a **kill**: destructive and irreversible, sent
+at `critical` urgency so it shows even under DND. That one notice *does* demand
+acknowledgement — precisely because it is the one thing you cannot undo. It is the
+exception that proves the rule: interrupt only for what you can't take back.
 
 This is the near-term expression of a larger direction (Weiser's *calm
 technology*): information should live in the **periphery** and move to the centre
@@ -159,7 +169,9 @@ dismiss) with an ambient-embodied one (things you *feel*):
   claimed it (**consent through attention**). Ignore it and it rests, visibly
   frozen, a Resume glyph breathing. One gesture dissolves three problems: no
   notification to dismiss, no risk of freezing the window you're actually using,
-  and no "is it broken?" confusion (the frost *is* the status).
+  and no "is it broken?" confusion (the frost *is* the status). *A crude, non-ambient
+  precursor shipped 2026-07-17: focusing a frozen window thaws it on the spot
+  (`guard::protect_foreground`) — consent through attention, minus the frost.*
 - **The ambient field.** Computational "weight" (memory-heavy windows have drag
   and denser shadows), subtle color-temperature drift under pressure, quiet
   sonification — memory state perceived pre-attentively, never read.
@@ -588,8 +600,15 @@ stance. Its deterministic half, `Restorability`, drives kill-victim ordering now
 extensible home for the old `is_claude` rule). Its thresholded half — CPU quiescence — is
 sampled and *logged only* (`ActivityMeter`, on the reconcile cadence), driving nothing, so
 the Idle threshold is earned from data the way the fault threshold was (20 cried wolf, 100
-was measured). The Idle class and its actuation (`cpu.idle`, squeezed-first) land once that
-data is in — a follow-up, not a phase. Ranked by how much of the *felt* gap
+was measured). The instrument was **corrected 2026-07-17**: it had logged only the idle
+tail (scopes under the 2% observation gate), which can never reveal where the idle/active
+*valley* — the actual threshold — sits; it now also emits a histogram of the whole
+distribution (every ~5 min) so both clusters are on record. The full Idle class and
+`cpu.idle` actuation land once that data is in — a follow-up, not a phase. Meanwhile an
+*interim* of the same intent shipped **2026-07-17**: the eviction rung now freezes the
+**idlest** big consumer rather than the largest (`mitigate::pick_freeze_index` ranks by a
+`cpu.stat` activity delta), so a session mid-response is the last thing paused, not a prime
+target by size. That is an ordering, threshold-free, so it is safe ahead of the measurement. Ranked by how much of the *felt* gap
 each one closes — the distance between "rtux
 reacted correctly" and "the machine felt powerful," which the 21:31 incident proved
 are different things. Recorded 2026-07-14; re-ranked 2026-07-15 against 22h of
@@ -715,8 +734,9 @@ ending this section):*
 **Admission control — the primitive, and why it went so long uncalled.** Everything
 else rtux does is post-hoc: pressure arrives, we react. The prior art is unanimous that the
 guarantee never comes from clever scheduling — it comes from *refusing work that
-doesn't fit*. (`advise_claude_sessions` is **not** this: it notifies after the
-sessions are already running, and can be ignored.)
+doesn't fit*. (`advise_claude_sessions` is **not** this: it flags — to the journal,
+since 2026-07-17, not a toast — after the sessions are already running, and can be
+ignored.)
 
 The primitive exists: **`ctl budget [MB]`** answers "can this machine afford N
 more right now?" and exits 0/1/2. It can only exist because the `app.slice`
