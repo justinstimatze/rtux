@@ -5,6 +5,34 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+### Fixed
+- **The freeze rung ran open-loop, and paused far more than it needed to.** The
+  daemon ticks at 1Hz but steers on `memory.some.avg10` — a *ten-second* average —
+  so a freeze could not show up in the signal for ~10s while `escalate()` kept
+  firing every tick. It overshot by roughly the ratio of the two cadences:
+  six apps frozen in six seconds, a shape that ran 69 times in six hours pausing
+  4–7 apps each. That was the whole of "rtux pauses everything". `FREEZE_SETTLE`
+  (10s, one PSI window) closes the loop — act, wait for the sensor to reflect it,
+  decide again. An episode's *first* freeze is never delayed and `kill_worst` is
+  deliberately not gated, so a genuine runaway is still caught at the old speed.
+  Confirmed on the live daemon: the same burst now spaces 10–11s apart.
+- **Focus thawed the wrong cgroup, so alt-tabbing to a paused window did nothing.**
+  `protect_foreground` thaws the focused *scope*, which is the whole story for a
+  browser and wrong for a terminal — the shell or agent runs in a **sibling** scope
+  systemd created, so focus thawed something that was never frozen while the paused
+  session stayed paused. Twelve hours of journal showed 6 focus-thaws against ~69
+  freeze cycles, not one of them a spawn scope. `guard::thaw_foreground_related`
+  now revives what focus actually owns, reusing `classify::is_foreground_related` —
+  the same predicate the eviction path uses to *spare* the foreground terminal — so
+  what focus protects and what focus revives cannot drift apart. Under tmux,
+  ancestry cannot work at all (a pane descends from the tmux server, not the
+  terminal), so `tmux-spawn` scopes fall back to a deliberately coarser question:
+  is the focused window a terminal running tmux? Confined to the thaw path on
+  purpose — widening the *freeze* path the same way would leave the rung no victims
+  under real pressure. The call also had to move ahead of `do_foreground`'s
+  `"unchanged"` early-return, since one terminal process owns every terminal window
+  and refocusing was therefore "unchanged" every time.
+
 ### Changed
 - **Toasts are reserved for kills.** On a machine that lives at the memory limit,
   the freeze notice fired on every freeze — a nine-app episode was nine popups —
@@ -25,10 +53,16 @@ tag is the source of truth (the binary reports it via `pressured --version`).
   an episode's first tick.
 
 ### Added
-- **Focus thaws.** Focusing a window rtux had frozen now unfreezes it immediately
-  (`guard::protect_foreground`), rather than waiting for pressure to clear and the
-  thaw hysteresis to elapse. Focus is intent; an unresponsive focused window is the
-  exact jank rtux exists to prevent.
+- **Focus thaws.** Focusing a window rtux had frozen now unfreezes it immediately,
+  rather than waiting for pressure to clear and the thaw hysteresis to elapse. Focus
+  is intent; an unresponsive focused window is the exact jank rtux exists to prevent.
+  (As first shipped this only reached the focused *scope*; see Fixed above for the
+  sibling-scope and tmux cases, which are most of the real workload.)
+- **A `focus thawed nothing:` diagnostic**, printed only when focus arrived, something
+  was frozen, and nothing was revived — naming the foreground pid, whether a tmux
+  client was reachable from it, and what was frozen. Without it, "the focus event
+  never arrived" and "the predicate declined" are the same silence in the journal,
+  which is what turned one measurement into three rounds of guessing.
 - **The quiescence instrument measures the whole distribution.** It had logged only
   the idle tail (scopes under the 2% gate), which can never reveal the idle/active
   valley the Idle threshold lives in. `ActivityMeter::observe` now also emits a
