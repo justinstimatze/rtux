@@ -163,7 +163,7 @@ pub fn spared_now(path: &Path) -> bool {
 /// of its tabs. Returns false when nothing has reported focus yet (fail-open:
 /// better to act than to freeze on ambiguity under real pressure — the Guaranteed
 /// spine is still protected regardless).
-fn is_foreground_related(path: &Path) -> bool {
+pub fn is_foreground_related(path: &Path) -> bool {
     let Some(fg_pid) = crate::ipc::foreground_pid() else {
         return false;
     };

@@ -1403,6 +1403,114 @@ pub fn protect_foreground(cgroup_path: &std::path::Path) -> Result<()> {
     result
 }
 
+/// Thaw every frozen cgroup the newly-focused window owns — not just the window's
+/// own scope, but the sibling `vte-spawn-*` / `tmux-spawn-*` scopes whose processes
+/// descend from it.
+///
+/// `protect_foreground` already thaws the focused *scope*, and for a browser that is
+/// the whole story. For a terminal it is the wrong cgroup entirely. Measured on this
+/// box: the shell/agent a terminal spawns does not live under the terminal's scope,
+/// it lives in a SIBLING scope created by systemd —
+///
+///     app.slice/app-gnome-terminator-<pid>.scope   <- what focus reports; no children
+///     app.slice/vte-spawn-7584e8d1-….scope           <- where the agent actually is
+///
+/// — so focusing the window thawed a scope that was never frozen, while the frozen
+/// session sat paused. Over 12h the journal showed 6 focus-thaws against ~69 freeze
+/// cycles, none of them a spawn scope. The felt symptom is alt-tabbing to a window
+/// and waiting out the pressure episode plus the recovery hysteresis, because focus
+/// was never actually reaching the thing that was paused.
+///
+/// The predicate is `classify::is_foreground_related` — deliberately the SAME one the
+/// eviction path uses to spare the foreground terminal and its tabs from being
+/// frozen. One definition, so "what focus protects" and "what focus revives" cannot
+/// drift apart.
+///
+/// Ancestry alone is NOT enough under tmux, which for a terminal-centric workload is
+/// most of it.
+/// A pane descends from the tmux server, not from the terminal, so the walk above
+/// reaches only `vte-spawn-*` scopes (a bare shell in a tab) and never the
+/// `tmux-spawn-*` scope the agent actually runs in. For those we fall back to the
+/// coarse question `cgroup::focus_owns_a_tmux_client` answers — "is the focused
+/// window a terminal running tmux?" — and thaw every frozen pane if so.
+///
+/// Coarse in two ways, both on purpose. A single terminator process owns every one
+/// of its windows, so `/proc` cannot say which window you focused; and the tmux
+/// fallback cannot say which session a client is attached to. Both err toward
+/// thawing more than strictly asked. That is the right failure direction here: they
+/// are all terminals you type in, the freeze rung picks up again on its next settle
+/// window with its idle bias intact, and the kill rung — the actual safety net —
+/// is deliberately not settle-gated, so a genuine runaway is still caught at full
+/// speed even if focus keeps reviving the freeze set.
+///
+/// Cost, honestly: the per-cgroup work (ancestry walk, the `/proc` scan) is paid only
+/// for cgroups that are actually FROZEN, and under normal conditions there are none.
+/// But the enumeration itself is not free — `list_freezable_cgroups` walks
+/// system.slice and every user's app.slice, reading two knobs per unit, and that
+/// happens on every focus change including the common one where nothing is paused.
+/// It is a few hundred small reads of an in-memory filesystem, off the daemon's
+/// reconcile thread, so it is affordable; it is not zero. If focus churn ever shows
+/// up in a profile, the fix is a frozen-count the mitigator publishes so this can
+/// return immediately when it is zero, not a cheaper walk.
+pub fn thaw_foreground_related() -> usize {
+    let Ok(candidates) = cgroup::list_freezable_cgroups() else {
+        return 0;
+    };
+    // Resolved lazily and once: the /proc scan is only worth paying for if something
+    // is actually frozen AND ancestry alone failed to explain it. Under normal
+    // conditions nothing is frozen and this stays None.
+    let mut tmux_reachable: Option<bool> = None;
+    let mut thawed = 0;
+    // Diagnostic state, reported below only when focus arrived and there WAS
+    // something frozen but nothing got thawed — the case that otherwise looks
+    // identical in the journal to "focus never arrived at all".
+    let mut frozen_seen: Vec<String> = Vec::new();
+    for (path, name, _mem) in candidates {
+        if cgroup::read_cgroup_u64(&path, "cgroup.freeze").ok() != Some(1) {
+            continue;
+        }
+        frozen_seen.push(cgroup::proc_label(&path).unwrap_or_else(|| name.clone()));
+        // Ancestry first — exact, and the whole answer for a browser or a bare shell
+        // in a terminal tab. Only when it says no do we fall back to the coarse tmux
+        // rule, which cannot be exact (see cgroup::focus_owns_a_tmux_client).
+        if !crate::classify::is_foreground_related(&path) {
+            if !cgroup::is_tmux_pane_scope(&path) {
+                continue;
+            }
+            let reachable = *tmux_reachable.get_or_insert_with(|| {
+                crate::ipc::foreground_pid()
+                    .map(cgroup::focus_owns_a_tmux_client)
+                    .unwrap_or(false)
+            });
+            if !reachable {
+                continue;
+            }
+        }
+        match crate::actions::thaw_cgroup(&path) {
+            Ok(()) => {
+                eprintln!("thawed on focus: {}", cgroup::proc_label(&path).unwrap_or(name));
+                thawed += 1;
+            }
+            Err(e) => eprintln!("failed to thaw focused {}: {}", path.display(), e),
+        }
+    }
+    // The decision table, in one line, printed only when it can teach us something:
+    // focus DID arrive, something WAS frozen, and yet nothing was revived. Without
+    // it, "the extension never sent anything" and "the predicate said no" produce an
+    // identical journal — silence — which is what made the focus-thaw bug take three
+    // rounds of guessing to localise. The absence of this line during an episode is
+    // itself the reading: it means do_foreground was never called.
+    if thawed == 0 && !frozen_seen.is_empty() {
+        eprintln!(
+            "focus thawed nothing: fg_pid={:?} tmux_client_reachable={:?} frozen=[{}]",
+            crate::ipc::foreground_pid(),
+            tmux_reachable,
+            frozen_seen.join(", ")
+        );
+    }
+    thawed
+}
+
 pub fn format_bytes(bytes: u64) -> String {
     if bytes >= 1024 * 1024 * 1024 {
         format!("{:.1}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))

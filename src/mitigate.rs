@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::classify;
 use crate::guard::format_bytes;
@@ -33,6 +33,16 @@ fn pick_freeze_index(ranked: &[(f64, u64)]) -> Option<usize> {
                 .then(b.1.cmp(&a.1))
         })
         .map(|(i, _)| i)
+}
+
+/// Has the last freeze had its settle window (see FREEZE_SETTLE)? `None` — nothing
+/// frozen yet — is always settled, so an episode's *first* freeze is never delayed;
+/// the gate only ever throttles the second and later freezes of a burst.
+fn settled(last_freeze: Option<Instant>, now: Instant) -> bool {
+    match last_freeze {
+        None => true,
+        Some(t) => now.duration_since(t) >= FREEZE_SETTLE,
+    }
 }
 
 /// The name to show in a notification / activity trail for a cgroup. Terminal
@@ -75,6 +85,24 @@ mod tests {
         assert_eq!(pick_victim_index(&[O, P, O]), Some(0));
         // A single Precious session is the victim only as the last resort, witnessed.
         assert_eq!(pick_victim_index(&[P]), Some(0));
+    }
+
+    /// The overshoot fix. A 1Hz rung steering on a 10s average froze six apps in six
+    /// seconds; the gate must hold the second freeze until the sensor could have seen
+    /// the first — while never delaying an episode's first freeze.
+    #[test]
+    fn a_freeze_waits_a_psi_window_before_the_next_one() {
+        let now = Instant::now();
+        // Nothing frozen yet: act immediately. Under real pressure the first freeze
+        // must not be slower than it was before this gate existed.
+        assert!(settled(None, now));
+        // The next tick, one second later — the whole bug. avg10 cannot have moved.
+        assert!(!settled(Some(now), now + Duration::from_secs(1)));
+        // Just short of the window is still too early; at the window we may act.
+        assert!(!settled(Some(now), now + FREEZE_SETTLE - Duration::from_millis(1)));
+        assert!(settled(Some(now), now + FREEZE_SETTLE));
+        // A long-idle daemon (last freeze an hour ago) is settled, not stuck.
+        assert!(settled(Some(now), now + Duration::from_secs(3600)));
     }
 
     #[test]
@@ -124,6 +152,32 @@ const SWAP_RECLAIM_CEILING: f64 = 0.70;
 /// Warn (once) when at least this many Claude sessions are running — an early,
 /// gentle nudge to close some before pressure ever forces a freeze or kill.
 const CLAUDE_SESSION_WARN_COUNT: usize = 4;
+/// Wait this long after a freeze before freezing anything else.
+///
+/// The daemon ticks at 1Hz but the signal it steers on is `memory.some.avg10` — a
+/// **10-second** moving average. A freeze cannot show up in that number for ~10s,
+/// so a per-tick freeze rung is an open loop: it keeps acting while waiting to
+/// observe the effect of what it already did, and overshoots by roughly the ratio
+/// of the two cadences. Measured in the wild on 2026-07-22:
+///
+///     23:43:23  froze Ollama (808MB)
+///     23:43:24  froze Google-chrome (840MB)
+///     23:43:25  froze claude · aipotluck.org (1.2GB)
+///     23:43:26  froze claude · winze (3.4GB)
+///     23:43:27  froze claude · plancheck (1.0GB)
+///     23:43:28  froze claude · mars (1.3GB)
+///
+/// Six apps in six seconds — the whole desktop paused when the first one or two
+/// would very likely have done it. Over six hours that pattern ran 69 times, each
+/// pausing 4–7 apps, which is what "rtux keeps pausing everything" actually is.
+///
+/// One settle window per freeze makes the rung a closed loop: act, wait for the
+/// sensor to reflect it, then decide again. It costs nothing in the case that
+/// matters — if pressure is genuinely still critical 10s later, the next freeze
+/// still happens — and the kill rung is deliberately NOT gated by it, so a true
+/// runaway is still caught at the same speed as before.
+const FREEZE_SETTLE: Duration = Duration::from_secs(10);
+
 pub struct Mitigator {
     frozen: Vec<(PathBuf, String)>,
     /// Cgroups we've SIGKILLed this episode. Kept only for the per-episode cap
@@ -140,6 +194,9 @@ pub struct Mitigator {
     /// long gap since the last sample just yields a longer-window average, the
     /// "idle for a while" signal we want on an episode's first freeze.
     cpu_seen: HashMap<PathBuf, (u64, Instant)>,
+    /// When the last freeze landed, so the next one waits a full PSI window for
+    /// the signal to reflect it (see FREEZE_SETTLE). `None` until the first freeze.
+    last_freeze: Option<Instant>,
     self_cgroup: Option<PathBuf>,
 }
 
@@ -151,6 +208,7 @@ impl Mitigator {
             advised: false,
             oom_biased: Vec::new(),
             cpu_seen: HashMap::new(),
+            last_freeze: None,
             self_cgroup: cgroup::self_cgroup(),
         }
     }
@@ -227,6 +285,12 @@ impl Mitigator {
         if self.frozen.len() >= MAX_FROZEN {
             return;
         }
+        // Closed loop, not open: give the previous freeze a full PSI window to show
+        // up in the average we steer on before deciding we need another one.
+        let now = Instant::now();
+        if !settled(self.last_freeze, now) {
+            return;
+        }
         let candidates = match cgroup::list_freezable_cgroups() {
             Ok(c) => c,
             Err(_) => return,
@@ -264,7 +328,6 @@ impl Mitigator {
         // next tick. Unmeasurable cgroups sort last (INFINITY). On an episode's first
         // tick nothing has a prior CPU sample, so every activity is unknown and this
         // degrades cleanly to the old largest-first behaviour.
-        let now = Instant::now();
         let mut ranked: Vec<(f64, PathBuf, String, u64)> = eligible
             .into_iter()
             .map(|(path, name, mem)| {
@@ -348,7 +411,8 @@ impl Mitigator {
                     eprintln!("froze {} ({})", disp, sz);
                     crate::events::record(format!("Paused {}", disp));
                     self.frozen.push((path, disp));
-                    return; // one freeze per tick
+                    self.last_freeze = Some(now);
+                    return; // one freeze, then a settle window before the next
                 }
                 Err(e) => {
                     eprintln!("failed to freeze {}: {}", path.display(), e);

@@ -303,6 +303,62 @@ fn ppid_of(pid: i32) -> Option<i32> {
     after.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Is this scope a tmux pane — a `tmux-spawn-*` cgroup systemd created for a pane's
+/// process? These are the scopes ancestry cannot reach from a focused window (see
+/// `focus_owns_a_tmux_client`).
+pub fn is_tmux_pane_scope(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| n.to_string_lossy().starts_with("tmux-spawn"))
+        .unwrap_or(false)
+}
+
+/// Does the focused window own a tmux *client*?
+///
+/// The join that does not exist. A tmux pane's process descends from the tmux
+/// SERVER, which systemd owns directly — measured 2026-07-22:
+///
+///     tmux-spawn-<uuid>.scope  ->  tmux: server  ->  systemd (user manager)
+///                                                    ^ not the terminal
+///
+/// so no ancestry walk from a focused terminal ever reaches a pane. The client is
+/// the other half, and it IS reachable:
+///
+///     tmux: client  ->  bash  ->  terminal   <- the focused window
+///
+/// but nothing joins a client to its panes outside tmux itself: panes carry
+/// `TMUX=<socket>,<server-pid>,<session-id>` in their environ while clients carry no
+/// session marker in either environ or cmdline. Querying the server for the map means
+/// a root daemon shelling out to tmux as the user, which is not worth it here.
+///
+/// So this answers the weaker question — "is the window you just focused a terminal
+/// with tmux running in it?" — and the caller treats a yes as covering every pane.
+/// Deliberately coarse, and deliberately scoped to the THAW path only: widening the
+/// freeze path's `is_foreground_related` this way would make every pane unfreezable
+/// whenever a terminal has focus — continuously, for a terminal-centric user — leaving
+/// the rung no
+/// victims at all. Thawing too much is recoverable in one settle window; having
+/// nothing to freeze under real pressure is not.
+pub fn focus_owns_a_tmux_client(fg_pid: i32) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for e in entries.flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
+            continue; // not a process directory
+        };
+        // "tmux: client" vs "tmux: server" — the server must NOT match, or every
+        // pane would look reachable from any focus at all.
+        match fs::read_to_string(format!("/proc/{}/comm", pid)) {
+            Ok(comm) if comm.trim() == "tmux: client" => {}
+            _ => continue,
+        }
+        if pid_descends_from(pid, fg_pid) {
+            return true;
+        }
+    }
+    false
+}
+
 /// True if `pid` is `ancestor` or descends from it via the parent chain. Used to
 /// spare the *foreground* terminal and all its tabs: the focus tracker reports
 /// the terminal window's pid, and its shell/agent children live in sibling
@@ -609,4 +665,21 @@ pub fn total_ram_bytes() -> Result<u64> {
         }
     }
     bail!("MemTotal not found in /proc/meminfo")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scopes ancestry cannot reach. `tmux-spawn-*` gets the coarse fallback;
+    /// `vte-spawn-*` and app scopes must NOT, since ancestry already answers for them
+    /// exactly and widening it would thaw panes on any focus at all.
+    #[test]
+    fn only_tmux_pane_scopes_take_the_coarse_path() {
+        let p = |s: &str| PathBuf::from("/sys/fs/cgroup/user.slice/app.slice").join(s);
+        assert!(is_tmux_pane_scope(&p("tmux-spawn-64c81969-5a39.scope")));
+        assert!(!is_tmux_pane_scope(&p("vte-spawn-674b05ed-e8ca.scope")));
+        assert!(!is_tmux_pane_scope(&p("app-gnome-terminator-1234.scope")));
+        assert!(!is_tmux_pane_scope(&p("ollama.service")));
+    }
 }
