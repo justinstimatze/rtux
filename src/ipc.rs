@@ -529,6 +529,20 @@ fn do_foreground(pid: i32) -> ActReply {
         return ActReply { ok: true, msg: format!("{} is a protected service — left as-is", name) };
     }
 
+    // Revive what focus actually owns, BEFORE the unchanged check below.
+    //
+    // Two reasons it has to be here and not inside protect_foreground. First,
+    // protect_foreground takes a cgroup and the thing we need is the *pid* — the
+    // frozen scope is a sibling of the focused one, reachable only by ancestry (see
+    // guard::thaw_foreground_related). Second, and more subtly, refocusing the app
+    // you were already on returns "unchanged" and skips everything below: with one
+    // terminal owning every terminal window, alt-tabbing between two of its windows
+    // is "unchanged" every time, so the one path that could revive a paused pane was
+    // being skipped in precisely the case the user hits most.
+    //
+    // FOREGROUND_PID is already stored above, so the predicate sees the new focus.
+    guard::thaw_foreground_related();
+
     // Recover from a poisoned lock rather than panicking the handler thread.
     let mut fg = FOREGROUND.lock().unwrap_or_else(|e| e.into_inner());
     if fg.as_deref() == Some(cg.as_path()) {
