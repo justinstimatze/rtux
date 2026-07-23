@@ -1403,6 +1403,10 @@ pub fn protect_foreground(cgroup_path: &std::path::Path) -> Result<()> {
     result
 }
 
+/// Last `focus thawed nothing:` line actually printed, so an unchanged situation
+/// reports once instead of once per focus event. Reset by a successful thaw.
+static LAST_FOCUS_MISS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// Thaw every frozen cgroup the newly-focused window owns — not just the window's
 /// own scope, but the sibling `vte-spawn-*` / `tmux-spawn-*` scopes whose processes
 /// descend from it.
@@ -1500,13 +1504,30 @@ pub fn thaw_foreground_related() -> usize {
     // identical journal — silence — which is what made the focus-thaw bug take three
     // rounds of guessing to localise. The absence of this line during an episode is
     // itself the reading: it means do_foreground was never called.
+    //
+    // Deduped on the whole rendered line, because this fires per FOCUS EVENT and a
+    // user switching windows generates many with nothing changed between them: eight
+    // identical lines came out of a little alt-tabbing with one thing frozen, and a
+    // real episode with heavy switching would bury the journal. Keying on the message
+    // rather than a timer is what makes it both quiet and lossless — an unchanged
+    // situation says nothing, while any change in the foreground, the tmux verdict,
+    // or the frozen set is by definition new information and prints immediately.
     if thawed == 0 && !frozen_seen.is_empty() {
-        eprintln!(
+        let msg = format!(
             "focus thawed nothing: fg_pid={:?} tmux_client_reachable={:?} frozen=[{}]",
             crate::ipc::foreground_pid(),
             tmux_reachable,
             frozen_seen.join(", ")
         );
+        let mut last = LAST_FOCUS_MISS.lock().unwrap_or_else(|e| e.into_inner());
+        if last.as_deref() != Some(msg.as_str()) {
+            eprintln!("{}", msg);
+            *last = Some(msg);
+        }
+    } else if thawed > 0 {
+        // A successful thaw ends the run: the next miss is a fresh fact even if it
+        // renders identically to one reported before it.
+        *LAST_FOCUS_MISS.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     thawed
 }

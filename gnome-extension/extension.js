@@ -125,7 +125,7 @@ export default class RtuxExtension extends Extension {
         // Attention-following: tell the daemon which app has focus so it can keep
         // that one resident under pressure. Fire on every focus change, plus once
         // now for whatever's already focused.
-        this._lastPid = 0;
+        this._lastWindow = 0;
         this._focusId = global.display.connect(
             'notify::focus-window', () => this._onFocus());
         this._onFocus();
@@ -154,11 +154,24 @@ export default class RtuxExtension extends Extension {
         } catch (e) {
             return;
         }
-        // Skip repeats (focus can notify several times for one switch) and our
-        // own HUD (already pinned; foregrounding it would just churn).
-        if (pid <= 0 || pid === this._lastPid)
+        // Dedup on the WINDOW, not the pid.
+        //
+        // focus-window notifies several times per switch, so some dedup is needed —
+        // but keying it on the pid silently drops the most common switch there is.
+        // One terminal process owns every one of its windows, so alt-tabbing from one
+        // terminal window to another produced a repeat pid and sent the daemon
+        // NOTHING — on a box with dozens of terminal windows open, that is the
+        // majority of all window switches. The daemon cannot thaw
+        // what it is never told about, so a paused session in the window you just
+        // switched to stayed paused until the pressure episode ended on its own —
+        // measured 2026-07-22 as 6 focus-thaws against ~69 freeze cycles.
+        //
+        // The window id distinguishes those; the pid is still what we send, since
+        // that is what the daemon resolves to a cgroup.
+        const wid = win.get_id?.() ?? pid;
+        if (pid <= 0 || wid === this._lastWindow)
             return;
-        this._lastPid = pid;
+        this._lastWindow = wid;
         this._sendForeground(pid);
     }
 
