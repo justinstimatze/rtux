@@ -53,15 +53,26 @@ pub enum Restorability {
     Precious,
 }
 
-/// The eviction prior AND the display label for a victim, from a SINGLE identity
-/// read. Deterministic: a Claude session is Precious and carries its rich session
-/// label; everything else is Ordinary and keeps its plain `name`.
+/// The eviction prior AND the display label for a victim. Deterministic: a Claude
+/// session is Precious and carries its rich session label; everything else is
+/// Ordinary and is named as well as it can be — by its largest process when it is a
+/// terminal child, by its plain app name otherwise.
 ///
-/// One read, not two, is load-bearing: `claude_session_label` does live IO
-/// (`/proc/*/comm`, `/proc/*/cwd`), so reading it separately for the rank and for
-/// the label let a mid-kill process-set change make the two disagree — a victim
-/// ranked Precious but shown with a plain name, or the reverse. Assessing both from
-/// one read keeps them consistent, the way the pre-judgment-tier code did.
+/// The rank comes from ONE identity read, and that is load-bearing:
+/// `claude_session_label` does live IO (`/proc/*/comm`, `/proc/*/cwd`), so asking it
+/// twice — once for the rank, once for the label — let a mid-kill process-set change
+/// make the two disagree, a victim ranked Precious but shown with a plain name or the
+/// reverse. The Ordinary branch therefore labels via `largest_proc_label`, which
+/// deliberately does NOT re-ask the Claude question; only the rank may decide it.
+///
+/// Why the Ordinary branch needs its own label at all: a terminal child's `name` is
+/// the useless generic "Terminal (child)", so a non-Claude hog inside one — a dev
+/// server, a notebook, a training run — was killed and announced with no identity
+/// whatsoever. The kill notification is the ONE message that has to survive being
+/// read cold, hours later, with the process already gone; "killed Terminal (child)
+/// (5.9GB)" is unactionable, and it named the eviction path's own blind spot rather
+/// than the victim. The freeze journal had been printing "MainThread · web" for that
+/// same scope all evening — the label existed, the kill path just never asked for it.
 ///
 /// This is the generalised, extensible home for the rule the eviction effector used
 /// to hard-code as an `is_claude` bool — the seam where a richer stance ("a video
@@ -70,7 +81,20 @@ pub enum Restorability {
 pub fn assess(path: &Path, name: String) -> (Restorability, String) {
     match cgroup::claude_session_label(path) {
         Some(label) => (Restorability::Precious, label),
-        None => (Restorability::Ordinary, name),
+        None => (Restorability::Ordinary, ordinary_label(path, name)),
+    }
+}
+
+/// Best available name for a non-Claude victim. Terminal children (vte-spawn /
+/// tmux-spawn) resolve to their largest process; every other scope keeps its app
+/// name, which is already the better label — "Google-chrome" beats naming Chrome
+/// after whichever renderer happened to be biggest.
+fn ordinary_label(path: &Path, name: String) -> String {
+    let raw = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    if raw.starts_with("vte-spawn") || raw.starts_with("tmux-spawn") {
+        cgroup::largest_proc_label(path).unwrap_or(name)
+    } else {
+        name
     }
 }
 
@@ -204,6 +228,28 @@ mod tests {
         let (rest, label) = assess(&plain, "Firefox".to_string());
         assert_eq!(rest, Restorability::Ordinary);
         assert_eq!(label, "Firefox");
+    }
+
+    /// The kill-witness regression, pinned. A non-Claude hog inside a terminal child
+    /// used to be announced as the generic "Terminal (child)", because `assess` only
+    /// ever consulted `claude_session_label` — so a 5.9GB dev server died with no
+    /// identity in the one notification that most needed it. Terminal children now
+    /// route through the largest-process label; every other scope keeps its app name,
+    /// which is already better than naming Chrome after a renderer.
+    ///
+    /// Both paths use unreadable paths on purpose: the point is which *branch* is
+    /// taken and that an empty read degrades to the fallback name rather than
+    /// panicking or yielding an empty label.
+    #[test]
+    fn a_terminal_child_is_never_announced_as_the_generic_name_when_a_label_exists() {
+        let spawn = PathBuf::from("/sys/fs/cgroup/.../tmux-spawn-deadbeef.scope");
+        let vte = PathBuf::from("/sys/fs/cgroup/.../vte-spawn-deadbeef.scope");
+        let app = PathBuf::from("/sys/fs/cgroup/.../app-gnome-Google-chrome-1.scope");
+        // Unreadable spawn scope -> the fallback name, never a panic or "".
+        assert_eq!(ordinary_label(&spawn, "Terminal (child)".to_string()), "Terminal (child)");
+        assert_eq!(ordinary_label(&vte, "Terminal (child)".to_string()), "Terminal (child)");
+        // A plain app scope must NOT be renamed after its largest process.
+        assert_eq!(ordinary_label(&app, "Google-chrome".to_string()), "Google-chrome");
     }
 
     /// The ordering the eviction effector relies on: Ordinary is strictly "evict
