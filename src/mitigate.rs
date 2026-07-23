@@ -581,6 +581,16 @@ impl Mitigator {
         }
     }
 
+    /// Is anything currently frozen? The per-tick focus rescue (main loop) gates on
+    /// this so an idle machine pays nothing: `guard::thaw_foreground_related` walks
+    /// system.slice and every app.slice, and that walk is only worth it when there is
+    /// actually a paused scope a newly-focused window might own. It is the
+    /// "frozen-count the mitigator publishes" that `thaw_foreground_related`'s own doc
+    /// names as the right gate.
+    pub fn has_frozen(&self) -> bool {
+        !self.frozen.is_empty()
+    }
+
     /// Pressure back to normal: undo the episode's *eviction* — thaw frozen apps
     /// and drop the OOM bias. The per-session memory caps are NOT touched here:
     /// they are a standing bound (guard::cap_active_sessions), released when a scope

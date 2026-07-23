@@ -33,6 +33,28 @@ tag is the source of truth (the binary reports it via `pressured --version`).
   `"unchanged"` early-return, since one terminal process owns every terminal window
   and refocusing was therefore "unchanged" every time.
 
+- **A focused pane could stay frozen while you typed in it.** The focus-thaw
+  above only ran on a focus *change* the GNOME extension reports (`do_foreground`).
+  Sit still in an already-focused tmux pane whose touch-shield had aged out past
+  `TOUCH_TTL`, and nothing re-checked it — the session sat paused ~40s until the
+  episode's recovery hysteresis expired, the exact felt jank rtux exists to
+  prevent. The main loop now re-runs `thaw_foreground_related` every tick while
+  anything is frozen (gated on the new `Mitigator::has_frozen`, so an idle box
+  pays nothing for the enumeration walk). It runs at all pressure levels on
+  purpose: even mid-Critical the window you are in must not stay paused, while
+  `escalate` freezes *other* candidates to find the memory. When both fire in the
+  same tick, a focused pane that was just picked is frozen and thawed inside that
+  one iteration, then left in the frozen ledger so `escalate`'s already-frozen
+  skip keeps it from being re-picked — no flap. The precise per-session shield is
+  the companion `pressured ctl touch` hook (UserPromptSubmit + PostToolUse); this
+  is its level-triggered backstop for the window before touch is universal. Under
+  tmux the rescue is necessarily coarse — it thaws every frozen pane when a
+  terminal is focused, since tmux cannot say which pane you are in — so an episode
+  freezes each tmux session briefly, reclaims its cold pages, and thaws it back
+  runnable, with the non-tmux hogs carrying the lasting relief. Confirmed live
+  across seven episodes: `thawed on focus:` for tmux sessions now appears every
+  cycle (absent the entire prior afternoon), zero kills.
+
 ### Changed
 - **Toasts are reserved for kills.** On a machine that lives at the memory limit,
   the freeze notice fired on every freeze — a nine-app episode was nine popups —
