@@ -317,6 +317,16 @@ impl Mitigator {
             if !path.join("cgroup.freeze").exists() {
                 continue;
             }
+            // A local server with a request in flight is not a freeze candidate.
+            // cgroup.freeze is SIGSTOP with no timeout, so its peer waits forever —
+            // and here the peers are the agent sessions this same rung is pausing.
+            // Idle servers stay eligible on purpose; they are the cheapest memory on
+            // the box (a model server frozen and reclaimed went 802MB -> 7.3MB, and
+            // its pages return only on demand). This spares in-flight work, not
+            // servers. Checked last: it is the only filter that walks /proc.
+            if cgroup::serving_local_clients(&path) {
+                continue;
+            }
             eligible.push((path, name, mem));
         }
 
