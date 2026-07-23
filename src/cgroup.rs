@@ -303,6 +303,134 @@ fn ppid_of(pid: i32) -> Option<i32> {
     after.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Socket inodes held by any process in this cgroup, from `/proc/<pid>/fd`.
+/// Bounded: a runaway fd table cannot make this walk unbounded work.
+fn socket_inodes_of(cgroup_path: &Path) -> std::collections::HashSet<u64> {
+    const MAX_FDS: usize = 4096;
+    let mut out = std::collections::HashSet::new();
+    let Ok(procs) = fs::read_to_string(cgroup_path.join("cgroup.procs")) else {
+        return out;
+    };
+    let mut seen = 0usize;
+    for pid in procs.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
+        let Ok(fds) = fs::read_dir(format!("/proc/{}/fd", pid)) else {
+            continue; // process ended, or not ours to read
+        };
+        for fd in fds.flatten() {
+            if seen >= MAX_FDS {
+                return out;
+            }
+            seen += 1;
+            if let Ok(target) = fs::read_link(fd.path()) {
+                if let Some(ino) = target
+                    .to_string_lossy()
+                    .strip_prefix("socket:[")
+                    .and_then(|s| s.strip_suffix(']'))
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    out.insert(ino);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Is this cgroup a local server with a client connected to it *right now*?
+///
+/// Freezing a server is not like freezing a client. `cgroup.freeze` is SIGSTOP with
+/// no timeout, so a peer waiting on a reply waits forever — there is no error to
+/// handle and no deadline to trip, only an indefinite stall that ends when something
+/// else happens to thaw it. A local model server makes this concrete: freeze it
+/// mid-embedding and whatever asked for that embedding hangs, and on this box the
+/// callers are the very sessions the freeze rung is also pausing.
+///
+/// The predicate is deliberately narrow: **listening, with an established loopback
+/// peer**. "Has network connections" would be far too broad — a browser and every
+/// agent session hold outbound sockets constantly, so that test would empty the
+/// candidate list and leave the rung nothing to freeze under real pressure.
+/// Direction is what distinguishes a server someone is waiting on from a client
+/// doing its own IO.
+///
+/// An idle server is still freezable, and should be: it is the cheapest memory on
+/// the box. Measured 2026-07-22 — a local model server frozen and reclaimed went
+/// from 802MB to 7.3MB resident, and pages return only on demand. This gate does not
+/// protect servers, it protects *in-flight requests*.
+///
+/// Restricted to `.service` units to bound the cost: it is the fd walk that is
+/// expensive, and confining it to services keeps browsers and agent scopes — the
+/// ones with thousands of fds — from ever paying for it.
+pub fn serving_local_clients(cgroup_path: &Path) -> bool {
+    let is_service = cgroup_path
+        .file_name()
+        .map(|n| n.to_string_lossy().ends_with(".service"))
+        .unwrap_or(false);
+    if !is_service {
+        return false;
+    }
+    let inodes = socket_inodes_of(cgroup_path);
+    if inodes.is_empty() {
+        return false;
+    }
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(content) = fs::read_to_string(table) else {
+            continue;
+        };
+        // Pass 1: which ports does THIS cgroup listen on?
+        let mut ports = std::collections::HashSet::new();
+        for f in content.lines().skip(1).map(tcp_fields) {
+            if let Some((local, _rem, st, ino)) = f {
+                if st == TCP_LISTEN && inodes.contains(&ino) {
+                    ports.insert(local.1);
+                }
+            }
+        }
+        if ports.is_empty() {
+            continue;
+        }
+        // Pass 2: is anything on this machine connected to one of them? A server-side
+        // established socket has the listening port as its LOCAL port.
+        for f in content.lines().skip(1).map(tcp_fields) {
+            if let Some((local, rem, st, _ino)) = f {
+                if st == TCP_ESTABLISHED && ports.contains(&local.1) && is_loopback_hex(rem.0) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+const TCP_ESTABLISHED: u8 = 0x01;
+const TCP_LISTEN: u8 = 0x0A;
+
+/// `(local_addr_hex, local_port), (rem_addr_hex, rem_port), state, inode` out of one
+/// `/proc/net/tcp{,6}` row. None on any malformed line — this is a kernel table, but
+/// a parse failure must never panic the daemon.
+fn tcp_fields(line: &str) -> Option<((&str, u16), (&str, u16), u8, u64)> {
+    let f: Vec<&str> = line.split_whitespace().collect();
+    if f.len() < 10 {
+        return None;
+    }
+    let (la, lp) = f[1].split_once(':')?;
+    let (ra, rp) = f[2].split_once(':')?;
+    Some((
+        (la, u16::from_str_radix(lp, 16).ok()?),
+        (ra, u16::from_str_radix(rp, 16).ok()?),
+        u8::from_str_radix(f[3], 16).ok()?,
+        f[9].parse().ok()?,
+    ))
+}
+
+/// Is this `/proc/net/tcp` hex address the loopback interface? `127.0.0.1` is stored
+/// little-endian as `0100007F`; IPv6 `::1` is the 32-hex-digit form. Anything else is
+/// a remote peer, which does not count — a client on another machine waiting on a
+/// reply is not the local stall this gate exists to prevent.
+fn is_loopback_hex(addr: &str) -> bool {
+    addr.eq_ignore_ascii_case("0100007F")
+        || addr.eq_ignore_ascii_case("00000000000000000000000001000000")
+}
+
 /// Is this scope a tmux pane — a `tmux-spawn-*` cgroup systemd created for a pane's
 /// process? These are the scopes ancestry cannot reach from a focused window (see
 /// `focus_owns_a_tmux_client`).
@@ -681,5 +809,47 @@ mod tests {
         assert!(!is_tmux_pane_scope(&p("vte-spawn-674b05ed-e8ca.scope")));
         assert!(!is_tmux_pane_scope(&p("app-gnome-terminator-1234.scope")));
         assert!(!is_tmux_pane_scope(&p("ollama.service")));
+    }
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+
+    /// Real rows off this box's /proc/net/tcp. The field offsets are the contract —
+    /// state is field 3 and inode is field 9 — and getting either wrong silently
+    /// turns the gate into "never fires" or "always fires".
+    #[test]
+    fn parses_a_listen_and_an_established_row() {
+        let listen = "   6: 0100007F:2CAA 00000000:0000 0A 00000000:00000000 00:00000000 00000000   998        0 27063251 2 0000000000000000 100 0 0 10 0";
+        let ((la, lp), _, st, ino) = tcp_fields(listen).expect("listen row parses");
+        assert_eq!((la, lp), ("0100007F", 11434)); // 0x2CAA
+        assert_eq!(st, TCP_LISTEN);
+        assert_eq!(ino, 27063251);
+
+        let est = "   0: 0100007F:2CAA 0100007F:8AF0 01 00000000:00000000 00:00000000 00000000  1000        0 24813604 1 0000000000000000 100 0 0 10 0";
+        let (_, (ra, _), st, _) = tcp_fields(est).expect("established row parses");
+        assert_eq!(st, TCP_ESTABLISHED);
+        assert!(is_loopback_hex(ra));
+    }
+
+    /// A malformed or truncated row must decline, never panic — this parses a kernel
+    /// table on the daemon's hot path.
+    #[test]
+    fn a_malformed_row_declines_rather_than_panicking() {
+        assert!(tcp_fields("").is_none());
+        assert!(tcp_fields("garbage").is_none());
+        assert!(tcp_fields("  sl  local_address rem_address   st tx_queue").is_none());
+    }
+
+    /// Only loopback peers count. A remote client waiting on a reply is not the local
+    /// stall this gate exists to prevent, and counting it would spare any listening
+    /// service the moment anything on the network touched it.
+    #[test]
+    fn only_loopback_peers_count() {
+        assert!(is_loopback_hex("0100007F"));
+        assert!(is_loopback_hex("00000000000000000000000001000000"));
+        assert!(!is_loopback_hex("00000000")); // 0.0.0.0 — a bind address, not a peer
+        assert!(!is_loopback_hex("0101A8C0")); // 192.168.1.1
     }
 }
