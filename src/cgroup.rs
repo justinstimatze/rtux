@@ -242,6 +242,20 @@ pub fn proc_label(cgroup_path: &Path) -> Option<String> {
     if let Some(label) = claude_session_label(cgroup_path) {
         return Some(label);
     }
+    largest_proc_label(cgroup_path)
+}
+
+/// `proc_label` minus the Claude question: name the scope after its largest
+/// process ("MainThread · web", "node · publicai").
+///
+/// Split out so the kill path can reach it *without* re-asking whether this is a
+/// Claude session. `judgment::assess` has already answered that question to pick
+/// the eviction rank, and calling `proc_label` there would ask a second time —
+/// re-reading `/proc` mid-kill, where a process set that changed between the two
+/// reads yields a victim ranked Ordinary but announced as "claude · dir". Keeping
+/// the two halves callable separately is what makes rank and label agree by
+/// construction rather than by luck.
+pub fn largest_proc_label(cgroup_path: &Path) -> Option<String> {
     let procs = fs::read_to_string(cgroup_path.join("cgroup.procs")).ok()?;
     let mut best_pid = 0i32;
     let mut best_rss = 0u64;

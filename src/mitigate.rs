@@ -505,7 +505,19 @@ impl Mitigator {
                 // (SWAP_HIGH_WATER) — so both the journal and `ctl history` show
                 // *why* a kill fired, making the 85% precipice auditable in the wild.
                 let swap_pct = cgroup::swap_used_fraction() * 100.0;
-                eprintln!("killed {} ({}) at swap {:.0}%", label, format_bytes(mem), swap_pct);
+                // The scope name goes in the journal (not the notification): it is the
+                // only durable handle on a victim once its processes are gone. With it,
+                // `journalctl` can recover when the scope started, what launched it, and
+                // its lifetime CPU/memory from systemd's own teardown line — the identity
+                // a label alone can't carry if labelling ever comes up empty again.
+                let scope = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                eprintln!(
+                    "killed {} ({}) at swap {:.0}% [{}]",
+                    label,
+                    format_bytes(mem),
+                    swap_pct,
+                    scope
+                );
                 crate::events::record(format!("Killed {} (swap {:.0}%)", label, swap_pct));
                 let tail = if rest == Restorability::Precious {
                     " You can restart this Claude session."
