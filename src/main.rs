@@ -263,6 +263,29 @@ impl Daemon {
             }
         }
 
+        // ── Level-triggered focus rescue ─────────────────────────────────────
+        // The edge-triggered focus path (ipc::do_foreground -> thaw_foreground_related)
+        // fires only on a focus *change* the GNOME extension reports. A pane frozen
+        // while you sit in it — touch aged out past TOUCH_TTL, no alt-tab to re-signal
+        // focus — would otherwise stay paused until the whole episode's recovery
+        // hysteresis expires. That is the exact felt bug: a foreground tmux session
+        // held frozen ~40s while the user typed in it.
+        //
+        // Re-run the same focus-thaw every tick while anything is frozen, so a focused
+        // pane is rescued within one tick regardless of whether focus moved. This runs
+        // at ALL pressure levels on purpose: even mid-Critical, the window you are in
+        // must not stay paused — escalate freezes *other* idle candidates to find the
+        // memory. When escalate and this run in the same Critical tick, a focused pane
+        // it happened to pick is frozen and thawed back inside that one iteration
+        // (sub-perceptual), then left alone: it stays in `frozen`, so escalate's
+        // already-frozen skip keeps it from being re-picked — no flap.
+        //
+        // Gated on `has_frozen` so an idle machine pays nothing for the enumeration
+        // walk; that walk is only worth its cost when a scope is actually paused.
+        if self.mitigator.has_frozen() {
+            guard::thaw_foreground_related();
+        }
+
         // NOTE: there is deliberately no reactive CPU rung here, and re-adding one
         // would be a regression. A previous version demoted background hogs'
         // cpu.weight whenever CPU PSI crossed a threshold, on the theory that
