@@ -83,9 +83,23 @@ pub fn cmd_ctl(action: &str, id: Option<&str>) -> Result<()> {
                 .with_context(|| format!("connecting to {} (is the daemon running?)", SOCKET_PATH))
         }
     };
+    // The socket is systemd-owned, so connect() succeeds even when the daemon is
+    // wedged or paging; without a deadline the read blocks forever. `ctl touch`
+    // runs as a PostToolUse hook in every Claude session, and on 2026-10-05 a
+    // stalled daemon hung all of them at once.
+    let deadline = Some(std::time::Duration::from_secs(2));
+    stream.set_read_timeout(deadline)?;
+    stream.set_write_timeout(deadline)?;
     writeln!(stream, "{}", req)?;
     let mut resp = String::new();
-    stream.read_to_string(&mut resp)?;
+    if let Err(e) = stream.read_to_string(&mut resp) {
+        if action == "budget" {
+            eprintln!("? no verdict — the daemon did not answer ({e})");
+            eprintln!("  This is NOT a refusal. Decide without rtux.");
+            std::process::exit(2);
+        }
+        return Err(e).context("waiting for the daemon's reply");
+    }
     let v: serde_json::Value =
         serde_json::from_str(resp.trim()).context("parsing daemon reply")?;
 
@@ -277,6 +291,7 @@ pub fn cmd_admit(want_mb: Option<u64>, force: bool, cmd: &[String]) -> Result<()
 fn ask_budget(want_mb: Option<u64>) -> Option<serde_json::Value> {
     let req = serde_json::json!({ "cmd": "budget", "want_mb": want_mb });
     let mut stream = UnixStream::connect(SOCKET_PATH).ok()?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok()?;
     writeln!(stream, "{}", req).ok()?;
     let mut resp = String::new();
     stream.read_to_string(&mut resp).ok()?;
@@ -312,6 +327,7 @@ fn ask_budget(want_mb: Option<u64>) -> Option<serde_json::Value> {
 /// gate itself misbehaves.
 fn print_biggest(n: usize) {
     let Ok(mut stream) = UnixStream::connect(SOCKET_PATH) else { return };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     if writeln!(stream, "{}", serde_json::json!({ "cmd": "list" })).is_err() {
         return;
     }
