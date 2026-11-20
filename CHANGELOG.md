@@ -5,7 +5,65 @@ tag is the source of truth (the binary reports it via `pressured --version`).
 
 ## [Unreleased]
 
+## [0.4.0] — keep the compositor off disk
+
+### Upgrading
+- Rerun `sudo ./install.sh`. It installs `pressured.socket`, creates the
+  `pressured` group, and adds desktop users to it. A user newly added to the group
+  must log out and back in before their desktop can reach the daemon.
+- Rerun `./install-extension.sh`. The new extension loads at your next login.
+- If this host runs zram in front of a disk swapfile, consider
+  `sudo scripts/host-zram-to-zswap.sh` (see Added).
+
+### Changed
+- **rtux no longer pages frozen apps out to disk.** After a freeze, forced reclaim
+  runs only when the pages stay in RAM: under zswap with that app's zswap
+  writeback turned off, or, without zswap, when the next swap slots are on zram.
+  It is skipped while IO PSI `full` is 10% or more, and capped at 1GB per app.
+  Before, once zram was full, every freeze could push the app's whole footprint
+  through the disk swapfile while the desktop waited behind it.
+- **A desktop waiting on disk counts as an emergency.** Three seconds at 100 or
+  more major faults/s across the compositor, input method, audio and session bus
+  freezes background apps and holds every thaw, even while memory PSI reads normal.
+  It never kills.
+- **Thaws are staggered.** Paused apps resume one at a time, 5s apart. An app
+  frozen again within 5 minutes of its thaw needs twice the calm before the next,
+  up to 320s.
+- **Kills are sized by what they free.** Memory an app holds as tmpfs or shared
+  memory no longer counts toward its kill size or rank, because killing the app
+  frees none of it.
+- **Background apps have a standing memory cap.** Each one is held to its share
+  of the app budget with `memory.high` (throttled into reclaim, never killed). The
+  focused app is exempt.
+- **A local server with a request in flight is not frozen**, so the client
+  waiting on it doesn't hang.
+- **Kill notifications name the victim and reach every logged-in user.**
+
+### Added
+- **`scripts/host-zram-to-zswap.sh`** switches the host from zram in front of disk
+  swap to zswap over the swapfile; `--undo` reverts it. `install.sh` no longer
+  offers zram while zswap is on.
+- **The tray dot shows whether the daemon is reachable.** It turns into a hollow
+  grey ○ when the extension can't get an answer over the control socket.
+- **`pressured ctl list` shows when each client last reached the socket**, per
+  user: the extension, `ctl touch`, and `ctl` itself.
+- **A one-time desktop notification when your session can't reach the daemon**
+  because it started before you joined the `pressured` group. Log out and back in.
+- **`pressured status` lists tmpfs mounts holding 64MB or more.**
+- **On a kill, the journal records the victim's temp and working directories**,
+  read just before the signal. rtux deletes nothing.
+- **The swap setup scripts warn when another sysctl file overrides
+  `vm.swappiness`**, naming the file.
+
 ### Fixed
+- **Apps stayed frozen after the daemon restarted or crashed.** On startup rtux now
+  thaws every app a previous run left frozen, and logs each one.
+- **The daemon could be OOM-killed at its own memory limit mid-episode**, stranding
+  its freezes. `MemoryMax` is now 256M.
+- **The control socket could stay root-owned after boot**, so focus reports and
+  session touches were refused without any error. systemd now creates it with group
+  `pressured`, mode 0660.
+- **`pressured ctl` could hang on a stalled daemon.** Its socket reads now time out.
 - **The freeze rung ran open-loop, and paused far more than it needed to.** The
   daemon ticks at 1Hz but steers on `memory.some.avg10` — a *ten-second* average —
   so a freeze could not show up in the signal for ~10s while `escalate()` kept
@@ -557,7 +615,8 @@ The initial public cut: a working, validated desktop-responsiveness daemon.
 - Installer, uninstaller, hotkey and extension setup scripts; a contained latency
   benchmark under `benchmarks/`.
 
-[Unreleased]: https://github.com/justinstimatze/rtux/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/justinstimatze/rtux/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/justinstimatze/rtux/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/justinstimatze/rtux/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/justinstimatze/rtux/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/justinstimatze/rtux/compare/v0.1.0...v0.2.0
