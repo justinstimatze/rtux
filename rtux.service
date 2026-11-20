@@ -9,6 +9,14 @@ Documentation=https://github.com/justinstimatze/rtux
 # daemon we don't need the graphical session to exist first; notifications
 # already degrade gracefully until a user session is present.
 
+# The control socket is created by pressured.socket, which applies its group and
+# mode before we start. Requires= (not Wants=) because a daemon running without
+# a reachable socket is the exact silent-outage state we're engineering away:
+# focus reports and session touches would both be refused and both clients fail
+# quietly. Better to fail visibly. See pressured.socket for the incident.
+Requires=pressured.socket
+After=pressured.socket
+
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/pressured daemon

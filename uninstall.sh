@@ -30,11 +30,24 @@ strip_from_list() {
 
 echo "== stopping + removing the service =="
 systemctl disable --now rtux.service 2>/dev/null
+# Socket after the service: with Requires=pressured.socket, taking the socket
+# down first can bring the service with it and muddy the disable above.
+systemctl disable --now pressured.socket 2>/dev/null
 rm -f /etc/systemd/system/rtux.service
+rm -f /etc/systemd/system/pressured.socket
+rm -f /run/pressured.sock
 rm -f /etc/systemd/system/user@.service.d/50-pressured-oomd.conf
 rmdir --ignore-fail-on-non-empty /etc/systemd/system/user@.service.d 2>/dev/null || true
 systemctl daemon-reload
 systemctl reset-failed rtux.service 2>/dev/null || true
+
+echo "== socket group =="
+# Left in place on purpose. groupdel would fail anyway while it is anyone's
+# supplementary group, and removing a group whose gid may have landed on files
+# elsewhere is a worse outcome than leaving an empty one behind.
+if getent group pressured >/dev/null; then
+    echo "  group 'pressured' left in place (harmless; remove with: sudo groupdel pressured)"
+fi
 
 echo "== removing binaries + desktop file =="
 rm -f /usr/local/bin/pressured /usr/local/bin/pressured-hud /usr/local/bin/pressured-tray

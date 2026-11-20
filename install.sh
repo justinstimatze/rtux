@@ -49,6 +49,44 @@ else
     echo "(pressured-hud not built — run: cargo build --release --features hud)"
 fi
 
+# --- The socket group ---
+# Everything that tells the daemon a human is present goes through
+# /run/pressured.sock: the GNOME extension's focus reports and each session's
+# `pressured ctl touch`. Both are unprivileged, so the socket needs a group they
+# are in. A dedicated group rather than the desktop user's primary group,
+# because a box can have two people logged in at once and a primary group can
+# only serve one of them.
+#
+# Both clients ignore write failures on purpose (a shell extension must not spam
+# the log; a UserPromptSubmit hook must not break a session), so if this group is
+# missing or empty the result is a silent, total outage of rtux's model of human
+# attention — with the daemon still reporting healthy. It happened on the dev box and
+# ran for 26 hours. Hence the loudness below.
+echo "Ensuring group    → pressured"
+if ! getent group pressured >/dev/null; then
+    groupadd -r pressured
+    echo "  created system group 'pressured'"
+fi
+# Every human user (uid >= 1000 with a real home) — not just $SUDO_USER, since
+# the person running the installer is not necessarily the only one who logs in.
+added=""
+while IFS=: read -r name _ uid _ _ home _; do
+    [[ "$uid" -ge 1000 && "$uid" -lt 65534 && -d "$home" ]] || continue
+    if ! id -nG "$name" | tr ' ' '\n' | grep -qx pressured; then
+        usermod -aG pressured "$name" && added="$added $name"
+    fi
+done < <(getent passwd)
+if [[ -n "$added" ]]; then
+    echo "  added to group:$added"
+    echo "  NOTE: group membership is read at LOGIN. Those users must log out and"
+    echo "        back in before their focus reports and touches will be accepted."
+else
+    echo "  all desktop users already members"
+fi
+
+echo "Installing socket → /etc/systemd/system/pressured.socket"
+install -m 0644 "$REPO/pressured.socket" /etc/systemd/system/pressured.socket
+
 echo "Installing unit   → /etc/systemd/system/rtux.service"
 install -m 0644 "$REPO/rtux.service" /etc/systemd/system/rtux.service
 
@@ -64,12 +102,36 @@ install -m 0644 "$REPO/50-pressured-oomd.conf" /etc/systemd/system/user@.service
 
 echo "Reloading systemd and (re)starting service..."
 systemctl daemon-reload
+# Stop the service before the socket: with Requires=pressured.socket, restarting
+# the socket under a live service leaves the daemon holding the old fd.
+systemctl stop rtux.service 2>/dev/null || true
+systemctl enable --now pressured.socket
 systemctl enable rtux.service
 systemctl restart rtux.service
 
 echo
 echo "--- systemctl status rtux.service ---"
 systemctl --no-pager --full status rtux.service | head -20 || true
+
+# The one check that would have caught the 26-hour outage: does the socket
+# actually have the group we just set up? Cheap, and it fails loudly.
+echo
+echo "--- control socket ---"
+if [[ -S /run/pressured.sock ]]; then
+    sock_group=$(stat -c '%G' /run/pressured.sock)
+    sock_mode=$(stat -c '%a' /run/pressured.sock)
+    echo "  /run/pressured.sock  group=$sock_group  mode=$sock_mode"
+    if [[ "$sock_group" != "pressured" ]]; then
+        echo "  !! WRONG GROUP — expected 'pressured'. Focus reports and session"
+        echo "     touches will be refused, and BOTH clients fail silently."
+    else
+        echo "  OK — the desktop users' group owns it."
+        echo "  Verify the round trip as a real user (not root):"
+        echo "     bash scripts/install-verify-focus.sh"
+    fi
+else
+    echo "  !! /run/pressured.sock does not exist — check: systemctl status pressured.socket"
+fi
 
 # --- Offer zram, rtux's base-layer companion ---
 # rtux keeps you responsive AT the memory wall; zram raises the wall so you
