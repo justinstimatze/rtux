@@ -139,7 +139,11 @@ fi
 # change. Control non-interactively with RTUX_ENABLE_ZRAM=1 (yes) / 0 (no).
 zram_active() { swapon --show=NAME --noheadings 2>/dev/null | grep -q '^/dev/zram'; }
 echo
-if zram_active; then
+if [[ "$(cat /sys/module/zswap/parameters/enabled 2>/dev/null)" == Y ]]; then
+    # zram in front of a disk swapfile inverts the LRU (cold pages fill zram,
+    # hot churn goes to disk); zswap does the same job without it.
+    echo "zram: skipped — zswap is on (scripts/host-zram-to-zswap.sh)."
+elif zram_active; then
     echo "zram: already active — nothing to do."
 else
     case "${RTUX_ENABLE_ZRAM:-ask}" in
