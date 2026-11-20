@@ -19,12 +19,13 @@ use std::collections::HashSet;
 use std::thread;
 use std::time::Duration;
 
-/// Sustained seconds of normal pressure required before thawing frozen apps.
-/// PSI is a ~10s average that can rebound within seconds, so recovering on the
-/// first normal tick caused thaw/re-freeze flapping (once observed thawing and
-/// going critical again within 6s). This gate holds recovery until the calm is
-/// real.
-const RECOVER_AFTER_NORMAL_SECS: u32 = 10;
+use mitigate::RECOVER_AFTER_NORMAL_SECS;
+
+/// Consecutive ticks of spine faults at the incident threshold that count as
+/// spine harm. One second over the line is a launch or a wake; three in a row is
+/// the compositor living on disk. At the 2026-11-20 lockup it ran 200-850
+/// faults/s for minutes while memory PSI read normal and rtux stood down.
+const SPINE_HARM_TICKS: u32 = 3;
 #[derive(Parser)]
 #[command(
     name = "pressured",
@@ -149,6 +150,8 @@ struct Daemon {
     ticks: u64,
     /// Consecutive normal-pressure ticks, for thaw hysteresis (see the const).
     normal_streak: u32,
+    /// Consecutive ticks the spine took INCIDENT_FAULTS_PER_TICK or more faults.
+    spine_streak: u32,
 }
 
 impl Daemon {
@@ -160,6 +163,7 @@ impl Daemon {
             activity: judgment::ActivityMeter::new(),
             ticks: 0,
             normal_streak: 0,
+            spine_streak: 0,
         }
     }
 
@@ -208,7 +212,13 @@ impl Daemon {
         // first. The 19s stall ran at cpu PSI 2.28 and memory PSI no threshold here
         // would have called critical; what it had was the input method faulting on
         // every keypress. That is what this counts.
-        self.meter.tick();
+        let spine = self.meter.tick();
+        if spine.faults >= health::INCIDENT_FAULTS_PER_TICK {
+            self.spine_streak = self.spine_streak.saturating_add(1);
+        } else {
+            self.spine_streak = 0;
+        }
+        let spine_harm = self.spine_streak >= SPINE_HARM_TICKS;
 
         let mem_psi = match psi::read_psi("/proc/pressure/memory") {
             Ok(r) => r,
@@ -240,6 +250,28 @@ impl Daemon {
                 self.mitigator.escalate();
                 self.mitigator.kill_worst();
             }
+            // Spine harm below critical memory PSI: the compositor is waiting on
+            // disk even though the memory average says the box is fine. Memory PSI
+            // is an average over every task; the spine is a handful of them, and it
+            // is the handful the user can see. Freeze background apps (reclaim is
+            // gated separately so it cannot add disk traffic) and hold every thaw
+            // while it lasts. No kill: the kill gate stays on memory alone.
+            _ if spine_harm => {
+                self.normal_streak = 0;
+                if self.spine_streak == SPINE_HARM_TICKS {
+                    let worst = spine.worst.as_ref().map(|(n, _)| n.as_str()).unwrap_or("?");
+                    eprintln!(
+                        "spine harm: {}+ major faults/s for {}s (worst: {}) at memory PSI {} — freezing background apps and holding thaws",
+                        health::INCIDENT_FAULTS_PER_TICK,
+                        SPINE_HARM_TICKS,
+                        worst,
+                        level
+                    );
+                    events::record(format!("Desktop waiting on disk ({}); pausing background apps", worst));
+                }
+                self.mitigator.bias_oom_toward_hogs();
+                self.mitigator.escalate();
+            }
             psi::PressureLevel::Elevated => {
                 self.normal_streak = 0;
                 // Memory bounding is no longer reactive here: the per-session cap
@@ -258,7 +290,7 @@ impl Daemon {
                 // back into the pressure that got it frozen (see the const).
                 self.normal_streak = self.normal_streak.saturating_add(1);
                 if self.normal_streak >= RECOVER_AFTER_NORMAL_SECS {
-                    self.mitigator.recover();
+                    self.mitigator.recover(self.normal_streak);
                 }
             }
         }
@@ -345,6 +377,8 @@ fn run_daemon() -> Result<()> {
     println!("pressured: protecting critical services...");
     let mut daemon = Daemon::new();
     protect_and_report(true, &mut daemon.announced);
+    // Before the loop: whatever a previous run left frozen, nothing else will thaw.
+    mitigate::thaw_orphans();
 
     // Control socket for the HUD / `ctl` client.
     ipc::spawn_server();

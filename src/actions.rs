@@ -11,10 +11,16 @@ pub fn freeze_cgroup(cgroup_path: &Path) -> Result<()> {
 }
 
 /// Thaw a cgroup subtree previously frozen via cgroup.freeze (writes "0").
+///
+/// Every thaw path (recovery, focus rescue, `ctl thaw`, the startup orphan sweep)
+/// comes through here, so this is where a freeze's zswap pin is released: a
+/// running app gets the kernel's default writeback back.
 pub fn thaw_cgroup(cgroup_path: &Path) -> Result<()> {
     let freeze_path = cgroup_path.join("cgroup.freeze");
     fs::write(&freeze_path, "0")
-        .with_context(|| format!("writing cgroup.freeze=0 to {}", freeze_path.display()))
+        .with_context(|| format!("writing cgroup.freeze=0 to {}", freeze_path.display()))?;
+    crate::cgroup::set_zswap_writeback(cgroup_path, true);
+    Ok(())
 }
 
 /// Throttle a cgroup: set memory.high so the kernel forces it to reclaim its own

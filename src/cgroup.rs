@@ -581,6 +581,92 @@ pub fn swap_used_fraction() -> f64 {
     }
 }
 
+/// One row of `/proc/swaps`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwapDev {
+    pub name: String,
+    pub size_kb: u64,
+    pub used_kb: u64,
+    pub prio: i64,
+}
+
+impl SwapDev {
+    /// zram is compressed RAM; every other swap device on this box is a disk.
+    pub fn in_ram(&self) -> bool {
+        self.name.starts_with("/dev/zram")
+    }
+    fn free_kb(&self) -> u64 {
+        self.size_kb.saturating_sub(self.used_kb)
+    }
+}
+
+pub fn parse_swaps(text: &str) -> Vec<SwapDev> {
+    text.lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() < 5 {
+                return None;
+            }
+            Some(SwapDev {
+                name: f[0].to_string(),
+                size_kb: f[2].parse().ok()?,
+                used_kb: f[3].parse().ok()?,
+                prio: f[4].parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+pub fn read_swaps() -> Vec<SwapDev> {
+    fs::read_to_string("/proc/swaps").map(|t| parse_swaps(&t)).unwrap_or_default()
+}
+
+/// Would swapping out `need_kb` right now land entirely in RAM-backed swap?
+///
+/// The kernel fills the highest-priority device that has free slots, and
+/// round-robins across devices of equal priority. So walk the priority tiers
+/// from the top: RAM free space counts toward `need_kb`, and the first disk
+/// device with free slots that comes before `need_kb` is covered means some of
+/// the push goes to disk. `swap_used_fraction` cannot answer this: on
+/// 2026-11-20 zram (prio 100) was full while total swap was 33% used, so every
+/// forced reclaim went to the encrypted swapfile and the total said "plenty of
+/// room".
+pub fn swapout_stays_in_ram(devs: &[SwapDev], need_kb: u64) -> bool {
+    let mut prios: Vec<i64> = devs.iter().map(|d| d.prio).collect();
+    prios.sort_unstable_by(|a, b| b.cmp(a));
+    prios.dedup();
+    let mut covered = 0u64;
+    for p in prios {
+        let tier: Vec<&SwapDev> = devs.iter().filter(|d| d.prio == p && d.free_kb() > 0).collect();
+        if tier.iter().any(|d| !d.in_ram()) {
+            return false;
+        }
+        covered = covered.saturating_add(tier.iter().map(|d| d.free_kb()).sum());
+        if covered >= need_kb {
+            return true;
+        }
+    }
+    false
+}
+
+/// zswap compresses swapped-out pages into a RAM pool in front of whatever swap
+/// device holds the slot. With `memory.zswap.writeback=0` on a cgroup, its pages
+/// either fit in that pool or are not swapped at all — they never reach disk.
+pub fn zswap_enabled() -> bool {
+    fs::read_to_string("/sys/module/zswap/parameters/enabled")
+        .map(|s| s.trim() == "Y")
+        .unwrap_or(false)
+}
+
+/// Best-effort: kernels before 6.8 have no `memory.zswap.writeback`.
+pub fn set_zswap_writeback(cgroup_path: &Path, on: bool) {
+    let knob = cgroup_path.join("memory.zswap.writeback");
+    if knob.exists() {
+        let _ = fs::write(knob, if on { "1" } else { "0" });
+    }
+}
+
 /// Enable the `cpu` controller on every ancestor of `leaf` from the cgroup root
 /// down to leaf's parent, so `cpu.weight` becomes writable on `leaf` (and on
 /// leaf's parent). cgroup v2 exposes a controller's knobs on a cgroup only if
@@ -823,6 +909,48 @@ mod tests {
         assert!(!is_tmux_pane_scope(&p("vte-spawn-674b05ed-e8ca.scope")));
         assert!(!is_tmux_pane_scope(&p("app-gnome-terminator-1234.scope")));
         assert!(!is_tmux_pane_scope(&p("ollama.service")));
+    }
+
+    fn dev(name: &str, size: u64, used: u64, prio: i64) -> SwapDev {
+        SwapDev { name: name.into(), size_kb: size, used_kb: used, prio }
+    }
+
+    #[test]
+    fn parses_proc_swaps() {
+        let t = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n\
+                 /swapfile                               file\t\t16777212\t0\t\t-1\n\
+                 /dev/zram0                              partition\t4194300\t\t291976\t\t100\n";
+        let d = parse_swaps(t);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[1], dev("/dev/zram0", 4194300, 291976, 100));
+        assert!(d[1].in_ram() && !d[0].in_ram());
+    }
+
+    /// The 2026-11-20 layout at the lockup: zram full, total swap a third used.
+    #[test]
+    fn full_zram_in_front_of_disk_sends_the_push_to_disk() {
+        let devs = [
+            dev("/dev/zram0", 7_700_000, 7_700_000, 100),
+            dev("/swapfile", 16_777_212, 1_000_000, -1),
+        ];
+        assert!(!swapout_stays_in_ram(&devs, 1_000));
+    }
+
+    #[test]
+    fn zram_with_room_covers_the_push() {
+        let devs = [
+            dev("/dev/zram0", 4_000_000, 1_000_000, 100),
+            dev("/swapfile", 16_777_212, 0, -1),
+        ];
+        assert!(swapout_stays_in_ram(&devs, 2_000_000));
+        // More than zram can hold spills onto the swapfile.
+        assert!(!swapout_stays_in_ram(&devs, 4_000_000));
+    }
+
+    #[test]
+    fn disk_only_or_no_swap_is_never_ram() {
+        assert!(!swapout_stays_in_ram(&[dev("/swapfile", 100, 0, -1)], 1));
+        assert!(!swapout_stays_in_ram(&[], 1));
     }
 }
 
