@@ -406,6 +406,7 @@ fn render_hud(v: &serde_json::Value) {
     };
     println!("Memory pressure: {} (some avg10={:.1}%, full avg10={:.1}%)", gauge, some, full);
     render_spine_health(v);
+    render_clients(v);
     println!();
     println!("{:<8} {:>9} {:>9}  {:<26} {}", "STATE", "MEM", "SWAP", "APP", "ID");
     println!("{}", "-".repeat(90));
@@ -479,6 +480,38 @@ fn render_spine_health(v: &serde_json::Value) {
         _ => "\x1b[31mSpine: UNKNOWN — rtux found no spine cgroups to measure\x1b[0m".to_string(),
     };
     println!("{line}");
+}
+
+/// When each client last reached the socket, e.g.
+/// `Clients: uid 1000 extension 2s ago · touch 4m ago`. A legibility line, not an
+/// alarm: silence has innocent causes (nobody typing), so it is never judged here.
+fn render_clients(v: &serde_json::Value) {
+    let Some(rows) = v["clients"].as_array() else { return };
+    if rows.is_empty() {
+        println!("Clients: none since the daemon started");
+        return;
+    }
+    let ago = |s: u64| match s {
+        0..=89 => format!("{s}s"),
+        90..=5399 => format!("{}m", s / 60),
+        _ => format!("{}h", s / 3600),
+    };
+    let mut by_uid: Vec<(u64, Vec<String>)> = Vec::new();
+    for r in rows {
+        let (Some(uid), Some(kind), Some(secs)) =
+            (r["uid"].as_u64(), r["kind"].as_str(), r["secs_ago"].as_u64())
+        else {
+            continue;
+        };
+        let item = format!("{kind} {} ago", ago(secs));
+        match by_uid.iter_mut().find(|(u, _)| *u == uid) {
+            Some((_, items)) => items.push(item),
+            None => by_uid.push((uid, vec![item])),
+        }
+    }
+    let parts: Vec<String> =
+        by_uid.into_iter().map(|(uid, items)| format!("uid {uid} {}", items.join(" · "))).collect();
+    println!("Clients: {}", parts.join("; "));
 }
 
 fn truncate(s: &str, max: usize) -> String {
