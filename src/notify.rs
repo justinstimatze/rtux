@@ -91,21 +91,35 @@ fn session_commands(program: &str, args: &[String]) -> Vec<Command> {
         cmd.args(args);
         return vec![cmd];
     }
-    graphical_uids()
-        .into_iter()
-        .filter_map(|uid| {
-            let user = User::from_uid(Uid::from_raw(uid)).ok().flatten()?;
-            let runtime = format!("/run/user/{uid}");
-            let bus = format!("unix:path={runtime}/bus");
-            let mut cmd = Command::new("runuser");
-            cmd.args(["-u", &user.name, "--", "env"])
-                .arg(format!("XDG_RUNTIME_DIR={runtime}"))
-                .arg(format!("DBUS_SESSION_BUS_ADDRESS={bus}"))
-                .arg(program)
-                .args(args);
-            Some(cmd)
-        })
-        .collect()
+    graphical_uids().into_iter().filter_map(|uid| command_for_uid(uid, program, args)).collect()
+}
+
+/// `program` inside one user's session, via runuser. Root only.
+fn command_for_uid(uid: u32, program: &str, args: &[String]) -> Option<Command> {
+    let user = User::from_uid(Uid::from_raw(uid)).ok().flatten()?;
+    let runtime = format!("/run/user/{uid}");
+    let bus = format!("unix:path={runtime}/bus");
+    let mut cmd = Command::new("runuser");
+    cmd.args(["-u", &user.name, "--", "env"])
+        .arg(format!("XDG_RUNTIME_DIR={runtime}"))
+        .arg(format!("DBUS_SESSION_BUS_ADDRESS={bus}"))
+        .arg(program)
+        .args(args);
+    Some(cmd)
+}
+
+/// Like `notify_session`, but to one user only: for a problem that is theirs
+/// alone, such as their own session lacking the socket's group.
+pub fn notify_user(uid: u32, urgency: &str, summary: &str, body: &str) {
+    eprintln!("[notify:{} uid {}] {} — {}", urgency, uid, summary, body);
+    if !Uid::effective().is_root() {
+        return;
+    }
+    let hints = format!("{{'transient': <true>, 'urgency': <byte {}>}}", urgency_byte(urgency));
+    let args = notify_call_args(summary, body, &[], &hints, 6000);
+    if let Some(mut cmd) = command_for_uid(uid, "gdbus", &args) {
+        let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    }
 }
 
 /// Quote a string as GVariant text, which is what `gdbus call` parses each

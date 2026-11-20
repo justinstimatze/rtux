@@ -9,3 +9,5 @@
    opened). A soft amber glow so a *past* event catches the eye without shouting,
    independent of the live dot colour. */
 .rtux-latched { text-shadow: 0 0 6px rgba(224, 165, 59, 0.9); }
+/* Daemon unreachable: the ping heartbeat failed (see extension.js _tick). */
+.rtux-off { color: #8a8a8a; }

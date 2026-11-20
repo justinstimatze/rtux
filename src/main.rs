@@ -1,5 +1,6 @@
 mod actions;
 mod cgroup;
+mod clients;
 mod classify;
 mod cli;
 mod events;
@@ -152,6 +153,8 @@ struct Daemon {
     normal_streak: u32,
     /// Consecutive ticks the spine took INCIDENT_FAULTS_PER_TICK or more faults.
     spine_streak: u32,
+    /// Can each desktop user's compositor reach the control socket?
+    group_check: clients::GroupCheck,
 }
 
 impl Daemon {
@@ -164,6 +167,7 @@ impl Daemon {
             ticks: 0,
             normal_streak: 0,
             spine_streak: 0,
+            group_check: clients::GroupCheck::default(),
         }
     }
 
@@ -202,6 +206,9 @@ impl Daemon {
             // builds a new session tree, and a meter holding the dead session's
             // paths would report a flatlined-because-gone spine as a healthy one.
             self.meter.refresh_spine();
+            // Same cadence and same reason: a re-login is when a user's groups
+            // change, so that is when their reachability can flip.
+            self.group_check.tick();
         }
 
         // ── OBSERVE ───────────────────────────────────────────────────────────

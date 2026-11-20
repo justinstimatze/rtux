@@ -1,9 +1,13 @@
 // rtux pressure indicator + attention feed.
 //
 // Two jobs, both of which only the shell can do:
-//   1. An ambient top-bar memory-pressure light. Reads /proc/pressure/memory
-//      ASYNCHRONOUSLY on a 2s timer, so it never blocks the shell (a
-//      responsiveness tool must never be the thing that stalls the compositor).
+//   1. An ambient top-bar memory-pressure light. Every 2s it asks the daemon
+//      for the level over /run/pressured.sock, ASYNCHRONOUSLY so it never blocks
+//      the shell (a responsiveness tool must never be the thing that stalls the
+//      compositor). It asks the daemon rather than reading /proc itself so the
+//      dot doubles as a heartbeat: if the round trip fails, the dot turns into a
+//      hollow grey ○ within one tick. When it read /proc directly it stayed green
+//      through a 26-hour outage in which every client was refused.
 //   2. Attention-following. The shell is the *only* thing that can see which
 //      window has focus on Wayland — org.gnome.Shell.Introspect denies it to
 //      unprivileged clients, and AT-SPI is off. So on every focus change we read
@@ -29,23 +33,10 @@ const SOCKET_PATH = '/run/pressured.sock';
 const SUMMON_HUD =
     "pkill -KILL -x pressured-hud; for i in $(seq 50); do pgrep -x pressured-hud >/dev/null || break; sleep 0.02; done; pressured-hud";
 
-function classify(psi) {
-    let some = 0, full = 0;
-    for (const line of psi.split('\n')) {
-        const m = line.match(/avg10=([\d.]+)/);
-        if (!m)
-            continue;
-        if (line.startsWith('some'))
-            some = parseFloat(m[1]);
-        else if (line.startsWith('full'))
-            full = parseFloat(m[1]);
-    }
-    if (some > 25 || full > 10)
-        return 'critical';
-    if (some > 5)
-        return 'elevated';
-    return 'normal';
-}
+// Give up on a ping after this long: a daemon that can't answer within 1.5s is
+// as unreachable as one that refuses, from the user's side.
+const PING_TIMEOUT_MS = 1500;
+const LEVELS = ['normal', 'elevated', 'critical'];
 
 const Indicator = GObject.registerClass(
 class RtuxIndicator extends PanelMenu.Button {
@@ -74,7 +65,24 @@ class RtuxIndicator extends PanelMenu.Button {
         });
     }
 
+    // The daemon could not be reached. Hollow grey until the next good ping;
+    // the reason goes to the shell's journal once per outage, not every tick.
+    setDisconnected(reason) {
+        if (this._offline === undefined || this._offline === null)
+            console.warn(`rtux: can't reach pressured at ${SOCKET_PATH}: ${reason}`);
+        this._offline = reason;
+        this._render();
+    }
+
     setLevel(level) {
+        if (this._offline) {
+            console.log('rtux: reached pressured again');
+            this._offline = null;
+        }
+        if (!LEVELS.includes(level)) {
+            this._render();
+            return;
+        }
         this._liveLevel = level;
         // Latch a witness the first time pressure goes critical. Even after PSI
         // falls back — and especially under Do-Not-Disturb, when no banner and no
@@ -95,8 +103,13 @@ class RtuxIndicator extends PanelMenu.Button {
     }
 
     _render() {
-        for (const c of ['rtux-good', 'rtux-warn', 'rtux-crit'])
+        for (const c of ['rtux-good', 'rtux-warn', 'rtux-crit', 'rtux-off', 'rtux-latched'])
             this._dot.remove_style_class_name(c);
+        if (this._offline) {
+            this._dot.add_style_class_name('rtux-off');
+            this._dot.set_text('○');
+            return;
+        }
         this._dot.add_style_class_name(
             this._liveLevel === 'critical' ? 'rtux-crit'
             : this._liveLevel === 'elevated' ? 'rtux-warn'
@@ -203,18 +216,73 @@ export default class RtuxExtension extends Extension {
         });
     }
 
+    // Ask the daemon for the pressure level. Any failure along the way (connect
+    // refused, EACCES, no reply, a reply that isn't a level) means the round trip
+    // is broken, and the dot says so. One ping in flight at a time, and none
+    // outlives PING_TIMEOUT_MS, so a wedged daemon can't pile up connections.
     _tick() {
-        const file = Gio.File.new_for_path('/proc/pressure/memory');
-        file.load_contents_async(null, (f, res) => {
-            let level = 'normal';
+        if (this._pinging)
+            return;
+        this._pinging = true;
+        const cancel = new Gio.Cancellable();
+        let timedOut = false;
+        const timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, PING_TIMEOUT_MS, () => {
+            timedOut = true;
+            cancel.cancel();
+            return GLib.SOURCE_REMOVE;
+        });
+        const done = (level, err) => {
+            if (!timedOut)
+                GLib.source_remove(timer);
+            this._pinging = false;
+            if (level)
+                this._indicator?.setLevel(level);
+            else
+                this._indicator?.setDisconnected(timedOut ? 'no reply within 1.5s' : err);
+        };
+
+        let client;
+        try {
+            client = new Gio.SocketClient();
+        } catch (e) {
+            done(null, e.message);
+            return;
+        }
+        const addr = new Gio.UnixSocketAddress({path: SOCKET_PATH});
+        client.connect_async(addr, cancel, (c, res) => {
+            let conn;
             try {
-                const [ok, contents] = f.load_contents_finish(res);
-                if (ok)
-                    level = classify(new TextDecoder().decode(contents));
+                conn = c.connect_finish(res);
+                conn.get_output_stream().write_all(
+                    new TextEncoder().encode('{"cmd":"ping"}\n'), cancel);
             } catch (e) {
-                // transient read failure — keep the last colour
+                try {
+                    conn?.close(null);
+                } catch (_) {}
+                done(null, e.message);
+                return;
             }
-            this._indicator?.setLevel(level);
+            const input = new Gio.DataInputStream({base_stream: conn.get_input_stream()});
+            input.read_line_async(GLib.PRIORITY_DEFAULT, cancel, (s, r) => {
+                let level = null;
+                let err = 'empty reply';
+                try {
+                    const [line] = s.read_line_finish_utf8(r);
+                    const reply = line ? JSON.parse(line) : null;
+                    if (reply?.ok && reply.level)
+                        level = reply.level;
+                    else if (reply)
+                        // An older daemon answers "bad request": reachable, but it
+                        // predates the heartbeat, so the dot can't trust it.
+                        err = reply.msg ?? 'unexpected reply';
+                } catch (e) {
+                    err = e.message;
+                }
+                try {
+                    conn.close(null);
+                } catch (_) {}
+                done(level, err);
+            });
         });
     }
 }

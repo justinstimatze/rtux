@@ -43,6 +43,24 @@ enum Request {
         #[serde(default)]
         want_mb: Option<u64>,
     },
+    /// The GNOME extension's 2s heartbeat: "what's the pressure level?". It asks
+    /// the daemon rather than reading /proc itself so that a broken round trip
+    /// shows on the tray dot within one tick. When the dot read /proc directly it
+    /// stayed green through a 26-hour socket outage.
+    Ping,
+}
+
+#[derive(Serialize)]
+struct PingReply {
+    ok: bool,
+    level: String,
+}
+
+#[derive(Serialize)]
+struct ClientSeen {
+    uid: u32,
+    kind: &'static str,
+    secs_ago: u64,
 }
 
 #[derive(Serialize)]
@@ -93,6 +111,8 @@ struct ListReply {
     /// How many spine cgroups the last tick actually read. Zero is the alarm: it
     /// means rtux is guarding a spine it cannot find.
     spine_observed: usize,
+    /// When each client last reached the socket (see clients.rs).
+    clients: Vec<ClientSeen>,
 }
 
 /// (used, total) for RAM and swap, from /proc/meminfo (bytes).
@@ -260,9 +280,9 @@ fn handle(stream: UnixStream) -> std::io::Result<()> {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     // Kernel-verified identity of the connecting process. Trust this, never a pid
     // a client puts in its JSON (which it can set to anything).
-    let peer_pid = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
-        .ok()
-        .map(|c| c.pid());
+    let peer = nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials).ok();
+    let peer_pid = peer.map(|c| c.pid());
+    let peer_uid = peer.map(|c| c.uid());
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
     let mut line = String::new();
@@ -273,7 +293,23 @@ fn handle(stream: UnixStream) -> std::io::Result<()> {
     if (&mut reader).take(64 * 1024).read_line(&mut line)? == 0 {
         return Ok(());
     }
-    let reply = match serde_json::from_str::<Request>(line.trim()) {
+    let request = serde_json::from_str::<Request>(line.trim());
+    if let (Ok(req), Some(uid)) = (&request, peer_uid) {
+        let kind = match req {
+            Request::Ping | Request::Foreground { .. } => "extension",
+            Request::Touch => "touch",
+            Request::PinSelf { .. } => "hud",
+            Request::List | Request::Act { .. } | Request::Budget { .. } => "ctl",
+        };
+        crate::clients::record(uid, kind);
+    }
+    let reply = match request {
+        Ok(Request::Ping) => serde_json::to_string(&PingReply {
+            ok: true,
+            level: psi::read_psi("/proc/pressure/memory")
+                .map(|r| psi::classify_pressure(&r).to_string())
+                .unwrap_or_else(|_| "unknown".into()),
+        }),
         Ok(Request::List) => serde_json::to_string(&build_list()),
         Ok(Request::Act { action, id }) => serde_json::to_string(&do_act(&action, &id)),
         // Ignore the client-supplied pid entirely — pin only the caller itself,
@@ -392,6 +428,10 @@ fn build_list() -> ListReply {
         spine_faults_peak: crate::health::peak(),
         spine_worst: latest.worst.map(|(name, _)| name),
         spine_observed: latest.observed,
+        clients: crate::clients::snapshot()
+            .into_iter()
+            .map(|(uid, kind, secs_ago)| ClientSeen { uid, kind, secs_ago })
+            .collect(),
     }
 }
 
