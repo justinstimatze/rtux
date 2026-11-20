@@ -55,21 +55,26 @@ use nix::unistd::{Uid, User};
 const NOTIFY_DEST: &str = "org.freedesktop.Notifications";
 const NOTIFY_PATH: &str = "/org/freedesktop/Notifications";
 
-/// Find the graphical user's uid by looking for a live session bus under /run/user.
-/// Picks the lowest uid >= 1000 that has a D-Bus socket.
-pub fn graphical_uid() -> Option<u32> {
-    let mut best: Option<u32> = None;
-    for entry in fs::read_dir("/run/user").ok()?.flatten() {
-        if let Ok(uid) = entry.file_name().to_string_lossy().parse::<u32>() {
-            if uid >= 1000 && entry.path().join("bus").exists() {
-                best = Some(best.map_or(uid, |b| b.min(uid)));
-            }
-        }
-    }
-    best
+/// Every desktop user with a live session bus under /run/user (uid >= 1000), in
+/// uid order.
+///
+/// All of them, not the lowest: a kill on a shared desktop can take a session
+/// that belongs to the second logged-in user, and that user is the one who needs
+/// to know. Picking min(uid) told only the first.
+pub fn graphical_uids() -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/run/user") else { return Vec::new() };
+    let mut uids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|e| {
+            let uid = e.file_name().to_string_lossy().parse::<u32>().ok()?;
+            (uid >= 1000 && e.path().join("bus").exists()).then_some(uid)
+        })
+        .collect();
+    uids.sort_unstable();
+    uids
 }
 
-/// Build a command that runs `program` inside the graphical user's session.
+/// Build one command per graphical session that runs `program` inside it.
 ///
 /// As root: `runuser` into the session, with the bus env injected *inside* the
 /// target via `env` rather than `Command::env` — runuser opens a PAM session that
@@ -78,25 +83,29 @@ pub fn graphical_uid() -> Option<u32> {
 ///
 /// As the user: run it directly; the env is already ours.
 ///
-/// None means there is no graphical session to talk to, which is a normal state
+/// Empty means there is no graphical session to talk to, which is a normal state
 /// (rtux starts at boot, before login) and not an error.
-fn session_command(program: &str, args: &[String]) -> Option<Command> {
+fn session_commands(program: &str, args: &[String]) -> Vec<Command> {
     if !Uid::effective().is_root() {
         let mut cmd = Command::new(program);
         cmd.args(args);
-        return Some(cmd);
+        return vec![cmd];
     }
-    let uid = graphical_uid()?;
-    let user = User::from_uid(Uid::from_raw(uid)).ok().flatten()?;
-    let runtime = format!("/run/user/{uid}");
-    let bus = format!("unix:path={runtime}/bus");
-    let mut cmd = Command::new("runuser");
-    cmd.args(["-u", &user.name, "--", "env"])
-        .arg(format!("XDG_RUNTIME_DIR={runtime}"))
-        .arg(format!("DBUS_SESSION_BUS_ADDRESS={bus}"))
-        .arg(program)
-        .args(args);
-    Some(cmd)
+    graphical_uids()
+        .into_iter()
+        .filter_map(|uid| {
+            let user = User::from_uid(Uid::from_raw(uid)).ok().flatten()?;
+            let runtime = format!("/run/user/{uid}");
+            let bus = format!("unix:path={runtime}/bus");
+            let mut cmd = Command::new("runuser");
+            cmd.args(["-u", &user.name, "--", "env"])
+                .arg(format!("XDG_RUNTIME_DIR={runtime}"))
+                .arg(format!("DBUS_SESSION_BUS_ADDRESS={bus}"))
+                .arg(program)
+                .args(args);
+            Some(cmd)
+        })
+        .collect()
 }
 
 /// Quote a string as GVariant text, which is what `gdbus call` parses each
@@ -182,11 +191,12 @@ pub fn notify_session(urgency: &str, summary: &str, body: &str) {
 
     let hints = format!("{{'transient': <true>, 'urgency': <byte {}>}}", urgency_byte(urgency));
     let args = notify_call_args(summary, body, &[], &hints, 6000);
-    let Some(mut cmd) = session_command("gdbus", &args) else { return };
     // Fire and forget, but keep the child's chatter out of the journal: a failure
     // here is already recorded by the eprintln above, and gdbus's own stderr would
     // just be a second, less legible copy.
-    let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    for mut cmd in session_commands("gdbus", &args) {
+        let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    }
 }
 
 #[cfg(test)]
