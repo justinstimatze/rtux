@@ -55,6 +55,14 @@ vm.swappiness = 180
 vm.page-cluster = 0
 EOF
 sysctl --system >/dev/null
+# sysctl --system applies files in name order, last write wins, so any file
+# sorting after ours (say a disk-era 99-vm-tuning.conf with swappiness=10)
+# silently defeats zram while this script reports success. Check what won.
+got=$(sysctl -n vm.swappiness)
+if [ "$got" != 180 ]; then
+    echo "WARNING: vm.swappiness is $got, not 180. Another sysctl file overrides ours:" >&2
+    grep -rn 'vm\.swappiness' /etc/sysctl.conf /etc/sysctl.d/ /run/sysctl.d/ /usr/lib/sysctl.d/ 2>/dev/null >&2
+fi
 
 echo "== (re)applying zram config =="
 # `apt install` may have already created zram0 at package defaults (4G/lzo-rle)

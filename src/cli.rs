@@ -4,6 +4,7 @@ use std::os::unix::net::UnixStream;
 
 use crate::guard::format_bytes;
 use crate::ipc::SOCKET_PATH;
+use crate::cgroup;
 use crate::psi;
 use crate::ranker;
 
@@ -31,6 +32,20 @@ pub fn cmd_status() -> Result<()> {
             full.avg10, full.avg60, full.avg300);
     }
     println!();
+
+    // tmpfs is memory that no process owns: freezing or killing the writer frees
+    // none of it, so it gets its own line rather than hiding in buff/cache.
+    let tmpfs: Vec<_> = cgroup::tmpfs_usage()
+        .into_iter()
+        .filter(|(_, used, _)| *used >= 64 * 1024 * 1024)
+        .collect();
+    if !tmpfs.is_empty() {
+        println!("tmpfs (RAM no process owns; only swap can take it):");
+        for (mount, used, size) in &tmpfs {
+            println!("  {} — {} of {}", mount, format_bytes(*used), format_bytes(*size));
+        }
+        println!();
+    }
 
     // Top consumers
     println!("Top memory consumers:");

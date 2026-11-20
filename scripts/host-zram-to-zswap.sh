@@ -51,7 +51,14 @@ cat > "$SYSCTL_NEW" <<EOF
 # zswap in front of /swapfile; see rtux scripts/host-zram-to-zswap.sh
 vm.swappiness = 100
 EOF
-sysctl -p "$SYSCTL_NEW"
+# Apply the way boot does (every file, name order, last write wins) and check
+# that ours won, so a later-sorting file can't quietly keep an old value.
+sysctl --system >/dev/null
+got=$(sysctl -n vm.swappiness)
+if [ "$got" != 100 ]; then
+    echo "WARNING: vm.swappiness is $got, not 100. Another sysctl file overrides ours:" >&2
+    grep -rn 'vm\.swappiness' /etc/sysctl.conf /etc/sysctl.d/ /run/sysctl.d/ /usr/lib/sysctl.d/ 2>/dev/null >&2
+fi
 sysctl -w vm.page-cluster=3   # kernel default; 0 was for zram's random access
 
 # 4. Runtime: turn zswap on now.
