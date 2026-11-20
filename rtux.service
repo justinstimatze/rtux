@@ -26,8 +26,12 @@ RestartSec=5
 OOMScoreAdjust=-1000
 # mlockall (CAP_IPC_LOCK) + raising our own limits if needed (CAP_SYS_RESOURCE).
 AmbientCapabilities=CAP_IPC_LOCK CAP_SYS_RESOURCE
-# Keep our own footprint bounded — the daemon stays tiny.
-MemoryMax=64M
+# Bound our own footprint, with room to spare. The daemon idles near 20M, but
+# mlockall makes every page it ever touches unreclaimable, so reaching the cap
+# means the kernel OOM-kills the protector in the middle of an episode, holding
+# freezes. That happened at the old 64M. No MemoryHigh: with every page locked,
+# the kernel's only response to crossing it is to put the daemon to sleep.
+MemoryMax=256M
 
 # --- Sandboxing ---
 # This is a root daemon, so it's hardened as far as its job allows. It is NOT

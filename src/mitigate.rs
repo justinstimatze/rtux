@@ -45,6 +45,96 @@ fn settled(last_freeze: Option<Instant>, now: Instant) -> bool {
     }
 }
 
+/// Where a forced `memory.reclaim` on a just-frozen scope would send its pages.
+#[derive(Debug, PartialEq, Eq)]
+enum ReclaimPlan {
+    /// zswap is on: pin the scope's writeback off, so its pages go to the
+    /// compressed pool or stay put, and never to disk.
+    Zswap,
+    /// No zswap, but the next swap slots are on zram.
+    RamSwap,
+    Skip(&'static str),
+}
+
+/// The freeze already stopped the growth; reclaim is a bonus that frees RAM, and
+/// it is only a bonus while the pages land in RAM. On 2026-11-20 thirteen forced
+/// reclaims pushed 9.4GB through the encrypted swapfile while the compositor
+/// queued behind them, because the only guard was total swap used.
+fn plan_reclaim(io_full_avg10: f64, swap_frac: f64, zswap: bool, ram_next: bool) -> ReclaimPlan {
+    if io_full_avg10 >= IO_FULL_RECLAIM_CEILING {
+        return ReclaimPlan::Skip("the disk is already saturated");
+    }
+    if swap_frac >= SWAP_RECLAIM_CEILING {
+        return ReclaimPlan::Skip("swap is nearly full");
+    }
+    if zswap {
+        ReclaimPlan::Zswap
+    } else if ram_next {
+        ReclaimPlan::RamSwap
+    } else {
+        ReclaimPlan::Skip("the next swap-out would go to disk")
+    }
+}
+
+/// How many times in a row this scope has been re-frozen soon after a thaw. A
+/// scope thawed and re-frozen within REFREEZE_WINDOW is ping-ponging: each round
+/// trip faults its whole working set back in and pushes it out again.
+fn backoff_level(prev_thaw: Option<(u32, Instant)>, now: Instant) -> u32 {
+    match prev_thaw {
+        Some((level, at)) if now.duration_since(at) < REFREEZE_WINDOW => {
+            (level + 1).min(MAX_BACKOFF_SHIFT)
+        }
+        _ => 0,
+    }
+}
+
+/// Seconds of continuous calm a scope at `level` needs before it may thaw:
+/// 10, 20, 40 ... 320.
+fn calm_required(level: u32) -> u32 {
+    RECOVER_AFTER_NORMAL_SECS << level.min(MAX_BACKOFF_SHIFT)
+}
+
+/// Which frozen scope to thaw next, given each one's backoff level in freeze
+/// order. The lowest level whose calm requirement is met; the earliest frozen
+/// among equals.
+fn pick_thaw(levels: &[u32], normal_secs: u32) -> Option<usize> {
+    levels
+        .iter()
+        .enumerate()
+        .filter(|(_, &l)| calm_required(l) <= normal_secs)
+        .min_by_key(|(i, &l)| (l, *i))
+        .map(|(i, _)| i)
+}
+
+/// Thaw every unit left frozen by an earlier daemon process.
+///
+/// `Mitigator.frozen` lives in memory, so a restart, panic or OOM of the daemon
+/// strands whatever it had paused: nothing else ever thaws it. Called once before
+/// the loop starts. Thawing everything is safe because the next critical tick
+/// re-freezes if pressure is still high, and it is better than adopting state
+/// written by a process that just crashed. This also resumes anything paused by
+/// hand with `ctl freeze`.
+pub fn thaw_orphans() {
+    let Ok(candidates) = cgroup::list_freezable_cgroups() else { return };
+    let mut thawed = 0;
+    for (path, name, mem) in candidates {
+        if cgroup::read_cgroup_u64(&path, "cgroup.freeze").ok() != Some(1) {
+            continue;
+        }
+        let scope = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let disp = display_name(&path, &name);
+        match actions::thaw_cgroup(&path) {
+            Ok(()) => {
+                thawed += 1;
+                eprintln!("startup: thawed orphaned freeze {} ({}) [{}]", disp, format_bytes(mem), scope);
+                crate::events::record(format!("Resumed {} (left paused by a previous run)", disp));
+            }
+            Err(e) => eprintln!("startup: failed to thaw orphaned freeze {}: {}", path.display(), e),
+        }
+    }
+    println!("pressured: startup orphan sweep thawed {} scope(s)", thawed);
+}
+
 /// The name to show in a notification / activity trail for a cgroup. Terminal
 /// children (vte-spawn / tmux-spawn) resolve to their rich session label — a
 /// Claude session becomes "claude · dir" — so the user sees *what* was paused or
@@ -106,6 +196,52 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_never_goes_to_disk() {
+        // The lockup: zram full, total swap 33%, IO full 49.5%.
+        assert_eq!(
+            plan_reclaim(49.5, 0.33, false, false),
+            ReclaimPlan::Skip("the disk is already saturated")
+        );
+        // A quiet disk doesn't make a disk-bound reclaim acceptable.
+        assert_eq!(
+            plan_reclaim(1.0, 0.33, false, false),
+            ReclaimPlan::Skip("the next swap-out would go to disk")
+        );
+        assert_eq!(plan_reclaim(1.0, 0.33, false, true), ReclaimPlan::RamSwap);
+        // zswap pins writeback off, so the slot's device doesn't matter.
+        assert_eq!(plan_reclaim(1.0, 0.33, true, false), ReclaimPlan::Zswap);
+        assert_eq!(plan_reclaim(1.0, 0.75, true, true), ReclaimPlan::Skip("swap is nearly full"));
+    }
+
+    #[test]
+    fn a_quick_refreeze_doubles_the_calm_needed_to_thaw() {
+        let now = Instant::now();
+        assert_eq!(backoff_level(None, now), 0);
+        assert_eq!(backoff_level(Some((0, now)), now + Duration::from_secs(30)), 1);
+        assert_eq!(backoff_level(Some((2, now)), now + Duration::from_secs(30)), 3);
+        // Long after its last thaw, a re-freeze is a new episode.
+        assert_eq!(backoff_level(Some((4, now)), now + REFREEZE_WINDOW), 0);
+        // Capped.
+        assert_eq!(backoff_level(Some((MAX_BACKOFF_SHIFT, now)), now), MAX_BACKOFF_SHIFT);
+        assert_eq!(calm_required(0), 10);
+        assert_eq!(calm_required(3), 80);
+        assert_eq!(calm_required(99), 320);
+    }
+
+    #[test]
+    fn thaws_one_at_a_time_lowest_backoff_first() {
+        assert_eq!(pick_thaw(&[], 100), None);
+        // Nobody has had enough calm yet.
+        assert_eq!(pick_thaw(&[1, 2], 15), None);
+        // Earliest-frozen among equals.
+        assert_eq!(pick_thaw(&[0, 0], 10), Some(0));
+        // A ping-ponging scope waits behind a fresh one frozen after it.
+        assert_eq!(pick_thaw(&[2, 0], 10), Some(1));
+        assert_eq!(pick_thaw(&[2], 39), None);
+        assert_eq!(pick_thaw(&[2], 40), Some(0));
+    }
+
+    #[test]
     fn freeze_targets_the_idlest_then_the_largest() {
         // (cpu activity as fraction-of-core, size bytes).
         // A busy 4GB app vs an idle 800MB one → freeze the idle one, felt-invisible,
@@ -149,6 +285,26 @@ const SWAP_HIGH_WATER: f64 = 0.85;
 /// SWAP_HIGH_WATER on purpose: we want to stop *shoving* long before we conclude
 /// the machine is out of room and reach for the kill rung.
 const SWAP_RECLAIM_CEILING: f64 = 0.70;
+/// Skip forced reclaim when IO PSI `full` avg10 is at or above this: every task
+/// on the box is already stalled on IO that share of the time, and a reclaim
+/// that touches the disk queues the compositor's own page-ins behind it. 49.5%
+/// at the 2026-11-20 lockup; ~2% on this box at rest.
+const IO_FULL_RECLAIM_CEILING: f64 = 10.0;
+/// Never force more than this out of one scope in one go. The old target was
+/// the scope's whole footprint (up to 4GB in one write).
+const RECLAIM_CAP_BYTES: u64 = 1024 * 1024 * 1024;
+/// Base calm before a frozen scope may thaw. PSI is a ~10s average that can
+/// rebound within seconds, so thawing on the first normal tick flapped (once
+/// thawing and going critical again within 6s). Doubles per back-to-back
+/// re-freeze of the same scope (see backoff_level).
+pub const RECOVER_AFTER_NORMAL_SECS: u32 = 10;
+/// A re-freeze within this long after a thaw counts as ping-pong.
+const REFREEZE_WINDOW: Duration = Duration::from_secs(300);
+/// Cap on the doubling: 10s << 5 = 320s.
+const MAX_BACKOFF_SHIFT: u32 = 5;
+/// Thaw one scope at a time, this far apart, so the swap-ins of several apps
+/// waking at once don't land on the disk together.
+const THAW_STAGGER: Duration = Duration::from_secs(5);
 /// Warn (once) when at least this many Claude sessions are running — an early,
 /// gentle nudge to close some before pressure ever forces a freeze or kill.
 const CLAUDE_SESSION_WARN_COUNT: usize = 4;
@@ -179,7 +335,12 @@ const CLAUDE_SESSION_WARN_COUNT: usize = 4;
 const FREEZE_SETTLE: Duration = Duration::from_secs(10);
 
 pub struct Mitigator {
-    frozen: Vec<(PathBuf, String)>,
+    /// (cgroup, display name, backoff level), in freeze order.
+    frozen: Vec<(PathBuf, String, u32)>,
+    /// Recently thawed scopes and the backoff level they thawed at, so a quick
+    /// re-freeze escalates its next calm requirement. Pruned past REFREEZE_WINDOW.
+    thawed: HashMap<PathBuf, (u32, Instant)>,
+    last_thaw: Option<Instant>,
     /// Cgroups we've SIGKILLed this episode. Kept only for the per-episode cap
     /// and to skip re-killing — a kill is not reversible, so recover() never
     /// touches these beyond clearing the list.
@@ -204,6 +365,8 @@ impl Mitigator {
     pub fn new() -> Self {
         Self {
             frozen: Vec::new(),
+            thawed: HashMap::new(),
+            last_thaw: None,
             killed: Vec::new(),
             advised: false,
             oom_biased: Vec::new(),
@@ -310,7 +473,7 @@ impl Mitigator {
             if self
                 .frozen
                 .iter()
-                .any(|(p, _)| &path == p || path.starts_with(p))
+                .any(|(p, _, _)| &path == p || path.starts_with(p))
             {
                 continue;
             }
@@ -361,7 +524,7 @@ impl Mitigator {
                     let p = path.clone();
                     let n = display_name(&path, &name);
                     let sz = format_bytes(mem);
-                    let reclaim_target = mem;
+                    let reclaim_target = mem.min(RECLAIM_CAP_BYTES);
                     std::thread::spawn(move || {
                         // Hibernate the frozen app's working set to compressed RAM
                         // (zram), freeing physical RAM. Best-effort — the kernel
@@ -383,15 +546,42 @@ impl Mitigator {
                         // prevent. Freezing alone (SIGSTOP) already stops the growth,
                         // which is the part that matters; the reclaim is only ever a
                         // bonus, so skip it rather than shove against a full swap.
-                        let headroom = cgroup::swap_used_fraction() < SWAP_RECLAIM_CEILING;
-                        if headroom {
-                            let _ = actions::reclaim_cgroup(&p, reclaim_target);
-                        } else {
-                            eprintln!(
-                                "skipped reclaim of {} — swap {:.0}% full, no room to page out",
-                                n,
-                                cgroup::swap_used_fraction() * 100.0
-                            );
+                        //
+                        // Total swap used is not enough on its own: it cannot see that
+                        // the fast tier is full and the push is going to disk. See
+                        // plan_reclaim for the full gate.
+                        let io_full = crate::psi::read_psi("/proc/pressure/io")
+                            .ok()
+                            .and_then(|r| r.full)
+                            .map(|f| f.avg10)
+                            .unwrap_or(0.0);
+                        let swap_frac = cgroup::swap_used_fraction();
+                        let ram_next =
+                            cgroup::swapout_stays_in_ram(&cgroup::read_swaps(), reclaim_target / 1024);
+                        match plan_reclaim(io_full, swap_frac, cgroup::zswap_enabled(), ram_next) {
+                            ReclaimPlan::Zswap => {
+                                cgroup::set_zswap_writeback(&p, false);
+                                let _ = actions::reclaim_cgroup(&p, reclaim_target);
+                                // A focus rescue can thaw the scope while the reclaim
+                                // runs; thaw_cgroup re-enabled writeback, and the write
+                                // above may have landed after it. A running app keeps
+                                // the default.
+                                if cgroup::read_cgroup_u64(&p, "cgroup.freeze").ok() != Some(1) {
+                                    cgroup::set_zswap_writeback(&p, true);
+                                }
+                            }
+                            ReclaimPlan::RamSwap => {
+                                let _ = actions::reclaim_cgroup(&p, reclaim_target);
+                            }
+                            ReclaimPlan::Skip(why) => {
+                                eprintln!(
+                                    "skipped reclaim of {}: {} (io full {:.1}%, swap {:.0}% used)",
+                                    n,
+                                    why,
+                                    io_full,
+                                    swap_frac * 100.0
+                                );
+                            }
                         }
                         let after = crate::cgroup::read_cgroup_u64(&p, "memory.current")
                             .unwrap_or(before);
@@ -418,9 +608,19 @@ impl Mitigator {
                     // spot (guard::protect_foreground). Toasts are reserved for the
                     // one destructive, irreversible event: kill_worst.
                     let disp = display_name(&path, &name);
-                    eprintln!("froze {} ({})", disp, sz);
+                    let level = backoff_level(self.thawed.get(&path).copied(), now);
+                    if level == 0 {
+                        eprintln!("froze {} ({})", disp, sz);
+                    } else {
+                        eprintln!(
+                            "froze {} ({}) again soon after its thaw; it now needs {}s of calm to thaw",
+                            disp,
+                            sz,
+                            calm_required(level)
+                        );
+                    }
                     crate::events::record(format!("Paused {}", disp));
-                    self.frozen.push((path, disp));
+                    self.frozen.push((path, disp, level));
                     self.last_freeze = Some(now);
                     return; // one freeze, then a settle window before the next
                 }
@@ -596,7 +796,14 @@ impl Mitigator {
     /// they are a standing bound (guard::cap_active_sessions), released when a scope
     /// becomes Focused, not when a pressure episode ends. An episode is over; the
     /// rule that no background session monopolises is always on.
-    pub fn recover(&mut self) {
+    ///
+    /// Called on every tick once pressure has been normal for
+    /// RECOVER_AFTER_NORMAL_SECS, with the length of the calm so far. Thaws at most
+    /// one scope per call and at most one per THAW_STAGGER: the lowest backoff level
+    /// whose calm requirement `normal_secs` meets. Thawing everything at once made
+    /// the whole frozen set fault its working set back in together, which on
+    /// 2026-11-20 re-created the pressure that froze it.
+    pub fn recover(&mut self, normal_secs: u32) {
         // Reset the per-episode kill cap and the advisory debounce. Kills are not
         // reversible, so there is nothing to undo — just start the next episode
         // fresh.
@@ -610,21 +817,30 @@ impl Mitigator {
             guard::unbias_hog_oom(&path);
         }
 
+        let now = Instant::now();
+        self.thawed.retain(|_, (_, at)| now.duration_since(*at) < REFREEZE_WINDOW);
         if self.frozen.is_empty() {
             return;
         }
-        let count = self.frozen.len();
-        for (path, name) in std::mem::take(&mut self.frozen) {
-            if let Err(e) = actions::thaw_cgroup(&path) {
-                eprintln!("failed to thaw {}: {}", path.display(), e);
-            } else {
-                eprintln!("thawed {}", name);
-                crate::events::record(format!("Resumed {}", name));
-            }
+        if self.last_thaw.is_some_and(|t| now.duration_since(t) < THAW_STAGGER) {
+            return;
         }
+        let levels: Vec<u32> = self.frozen.iter().map(|f| f.2).collect();
+        let Some(i) = pick_thaw(&levels, normal_secs) else { return };
+        let (path, name, level) = self.frozen.remove(i);
+        self.last_thaw = Some(now);
+        if let Err(e) = actions::thaw_cgroup(&path) {
+            eprintln!("failed to thaw {}: {}", path.display(), e);
+        } else {
+            eprintln!("thawed {} ({} still paused)", name, self.frozen.len());
+            crate::events::record(format!("Resumed {}", name));
+        }
+        self.thawed.insert(path, (level, now));
         // No toast on recovery either — the return to normal is the good case, and
         // the per-app "thawed"/"Resumed" lines above already record it. Reserve the
         // interruption budget for the one bad, irreversible outcome: a kill.
-        eprintln!("pressure cleared — resumed {} paused app(s)", count);
+        if self.frozen.is_empty() {
+            eprintln!("pressure cleared — every paused app resumed");
+        }
     }
 }

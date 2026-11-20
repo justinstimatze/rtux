@@ -70,7 +70,7 @@ const CAP: usize = 60;
 ///
 /// Re-derive this if the swap device changes. It is a wall-clock claim wearing a
 /// fault-count costume, and the costume only fits this machine.
-const INCIDENT_FAULTS_PER_TICK: u64 = 100;
+pub const INCIDENT_FAULTS_PER_TICK: u64 = 100;
 
 /// One tick of spine harm.
 #[derive(Clone, Debug, PartialEq)]
