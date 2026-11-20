@@ -581,6 +581,84 @@ pub fn swap_used_fraction() -> f64 {
     }
 }
 
+/// Every pid in a cgroup and its descendants.
+pub fn pids_recursive(cgroup_path: &Path) -> Vec<i32> {
+    let mut out: Vec<i32> = fs::read_to_string(cgroup_path.join("cgroup.procs"))
+        .map(|s| s.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    if let Ok(entries) = fs::read_dir(cgroup_path) {
+        for e in entries.flatten() {
+            if e.path().is_dir() {
+                out.extend(pids_recursive(&e.path()));
+            }
+        }
+    }
+    out
+}
+
+/// Environment variables that name where a process writes its scratch.
+const SCRATCH_VARS: [&str; 5] = ["TMPDIR", "GOTMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME"];
+
+/// Where a cgroup's processes keep scratch: the distinct scratch variables from
+/// their environ and their working directories, read while they are still alive.
+///
+/// A SIGKILL runs no cleanup handler, so a killed `go build` leaves its
+/// `$TMPDIR/go-build*` behind under a name nobody recorded. The moment before the
+/// kill is the last point at which these paths are attributable; after it,
+/// /proc/PID is gone. Capped so a cgroup with hundreds of processes can't flood
+/// the journal line.
+pub fn scratch_hints(cgroup_path: &Path) -> Vec<String> {
+    const MAX: usize = 8;
+    let mut out: Vec<String> = Vec::new();
+    let push = |s: String, out: &mut Vec<String>| {
+        if out.len() < MAX && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    for pid in pids_recursive(cgroup_path) {
+        if let Ok(env) = fs::read(format!("/proc/{pid}/environ")) {
+            for kv in env.split(|&b| b == 0) {
+                let kv = String::from_utf8_lossy(kv);
+                if let Some((k, _)) = kv.split_once('=') {
+                    if SCRATCH_VARS.contains(&k) {
+                        push(kv.to_string(), &mut out);
+                    }
+                }
+            }
+        }
+        if let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) {
+            push(format!("cwd={}", cwd.display()), &mut out);
+        }
+    }
+    out
+}
+
+/// Used and total bytes of every tmpfs mount that can hold real data.
+///
+/// tmpfs pages are memory that only swap can take: no process owns them, so
+/// freezing or killing the writer frees none of it, and `free` files them under
+/// buff/cache as if they were droppable. Per-unit credential mounts are skipped:
+/// they are kilobytes, and there is one per service.
+// statvfs fields are c_ulong / fsblkcnt_t: u64 here, 32 bits on other targets.
+#[allow(clippy::unnecessary_cast)]
+pub fn tmpfs_usage() -> Vec<(String, u64, u64)> {
+    let Ok(mounts) = fs::read_to_string("/proc/mounts") else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in mounts.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 3 || f[2] != "tmpfs" || f[1].starts_with("/run/credentials/") {
+            continue;
+        }
+        if let Ok(st) = nix::sys::statvfs::statvfs(f[1]) {
+            let frag = st.fragment_size() as u64;
+            let size = st.blocks() as u64 * frag;
+            let used = size.saturating_sub(st.blocks_free() as u64 * frag);
+            out.push((f[1].to_string(), used, size));
+        }
+    }
+    out
+}
+
 /// One row of `/proc/swaps`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwapDev {
@@ -909,6 +987,17 @@ mod tests {
         assert!(!is_tmux_pane_scope(&p("vte-spawn-674b05ed-e8ca.scope")));
         assert!(!is_tmux_pane_scope(&p("app-gnome-terminator-1234.scope")));
         assert!(!is_tmux_pane_scope(&p("ollama.service")));
+    }
+
+    /// Reads this test process's own cgroup, so it needs no fixture: the test
+    /// runner itself has a cwd, and that is what a kill would record.
+    #[test]
+    fn scratch_hints_reads_live_processes() {
+        let Some(cg) = self_cgroup() else { return };
+        if pids_recursive(&cg).is_empty() {
+            return;
+        }
+        assert!(scratch_hints(&cg).iter().any(|h| h.starts_with("cwd=")));
     }
 
     fn dev(name: &str, size: u64, used: u64, prio: i64) -> SwapDev {

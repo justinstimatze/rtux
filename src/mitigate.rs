@@ -106,6 +106,18 @@ fn pick_thaw(levels: &[u32], normal_secs: u32) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// Bytes a kill would free: the footprint minus the cgroup's shmem.
+///
+/// Shmem charged to a cgroup is mostly tmpfs pages it wrote (in /tmp or
+/// /dev/shm). Those belong to the file, not the writer, so killing the writer
+/// frees none of them; a build that filled /tmp would otherwise rank as a top
+/// hog and die for nothing. Some shmem (memfd, anonymous shared mappings) is
+/// freed when its last mapper dies, so this undercounts browsers somewhat; the
+/// error can only shrink a candidate, which is the safe direction for a kill.
+fn killable_bytes(footprint: u64, shmem: u64) -> u64 {
+    footprint.saturating_sub(shmem)
+}
+
 /// Thaw every unit left frozen by an earlier daemon process.
 ///
 /// `Mitigator.frozen` lives in memory, so a restart, panic or OOM of the daemon
@@ -193,6 +205,15 @@ mod tests {
         assert!(settled(Some(now), now + FREEZE_SETTLE));
         // A long-idle daemon (last freeze an hour ago) is settled, not stuck.
         assert!(settled(Some(now), now + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn a_tmpfs_writer_is_not_worth_killing() {
+        const G: u64 = 1024 * 1024 * 1024;
+        // 3GB footprint, 2.8GB of it files in /tmp: a kill frees ~200MB.
+        assert!(killable_bytes(3 * G, 2_800 * 1024 * 1024) < MIN_KILL_BYTES);
+        assert_eq!(killable_bytes(2 * G, 0), 2 * G);
+        assert_eq!(killable_bytes(G, 2 * G), 0);
     }
 
     #[test]
@@ -689,16 +710,28 @@ impl Mitigator {
             if self.denied(&name, &path) || self.killed.iter().any(|p| p == &path) {
                 continue;
             }
+            // Size by what a kill actually frees. See killable_bytes.
+            let shmem = cgroup::read_memory_stat_field(&path, "shmem").unwrap_or(0);
+            let mem = killable_bytes(mem, shmem);
+            if mem < MIN_KILL_BYTES {
+                continue;
+            }
             // One identity read yields both the rank and the display label, so a
             // mid-kill process-set change can't make them disagree.
             let (rest, label) = judgment::assess(&path, name);
             eligible.push((path, label, mem, rest));
         }
+        // Subtracting shmem can reorder the candidates; pick_victim_index wants
+        // them largest-first.
+        eligible.sort_by_key(|e| std::cmp::Reverse(e.2));
         let ranks: Vec<Restorability> = eligible.iter().map(|e| e.3).collect();
         let Some(idx) = pick_victim_index(&ranks) else {
             return; // nothing eligible to kill
         };
         let (path, label, mem, rest) = eligible.swap_remove(idx);
+        // Read before the signal: one second after it, /proc/PID is gone and
+        // whatever scratch the victim was writing has no recorded owner.
+        let scratch = cgroup::scratch_hints(&path);
         match actions::kill_cgroup(&path) {
             Ok(_) => {
                 // Record the swap level that justified crossing the kill gate
@@ -718,6 +751,11 @@ impl Mitigator {
                     swap_pct,
                     scope
                 );
+                // A SIGKILL runs no cleanup, so the victim's temp dirs stay on disk
+                // (or in tmpfs, i.e. in RAM). Recording only; rtux never deletes.
+                if !scratch.is_empty() {
+                    eprintln!("killed {} left its scratch unowned: {}", label, scratch.join(" "));
+                }
                 crate::events::record(format!("Killed {} (swap {:.0}%)", label, swap_pct));
                 let tail = if rest == Restorability::Precious {
                     " You can restart this Claude session."
