@@ -1,0 +1,59 @@
+[Unit]
+Description=pressured control socket
+Documentation=https://github.com/justinstimatze/rtux
+# Why this unit exists at all, since the daemon is perfectly capable of calling
+# bind(2) itself — and did, until 2026-08-07.
+#
+# The socket must be group-owned by the desktop users who talk to it: the GNOME
+# extension reporting which window has focus, and each Claude session's
+# `pressured ctl touch`. When the daemon owned the bind, it discovered that group
+# at bind time from /run/user/* (notify::graphical_uid). rtux starts at boot.
+# At boot nobody has logged in, /run/user/<uid> does not exist, the lookup
+# returns None, and the chown is skipped — leaving the socket root:root 0660 for
+# the entire life of the daemon, because serve() runs exactly once.
+#
+# Measured on the dev box 2026-08-07: the socket had been root:root for 26 hours (its
+# mtime equalled boot), every client got EACCES, and the daemon logged
+# `fg_pid=None` on 38 of 38 focus misses that day with zero successful focus
+# thaws. Both clients swallow write failures by design — correctly, a shell
+# extension must not spam the log and a UserPromptSubmit hook must not break a
+# session — so a total outage of rtux's model of human attention was completely
+# silent at both ends while the daemon looked healthy.
+#
+# systemd creates this socket BEFORE the daemon runs and applies SocketGroup=
+# and SocketMode= itself, so ownership no longer depends on runtime state that
+# may not exist yet. There is no window in which the permissions are wrong.
+#
+# It also sidesteps the ordering trap documented at the top of rtux.service: we
+# no longer want to be After=graphical.target (which would form a cycle and get
+# our start job deleted), because we no longer need a logged-in user to exist
+# before we can set the socket up correctly.
+
+[Socket]
+# systemd's default pairing is <name>.socket -> <name>.service, and this daemon's
+# unit is rtux.service, not pressured.service. Without this line `systemd-analyze
+# verify` reports "service pressured.service not loaded, socket cannot be
+# started" and the socket activates nothing.
+Service=rtux.service
+ListenStream=/run/pressured.sock
+SocketMode=0660
+# A dedicated group, NOT the graphical user's primary group. install.sh creates
+# it and adds every human user with a home directory.
+#
+# The old code chowned to the primary group of min(uid) across /run/user/*, which
+# can only ever serve ONE user. A desktop with two live graphical sessions
+# (uids 1000 and 1001, both running Claude sessions) would have one of them
+# locked out even by a working chown. A shared group is the only shape that
+# fits a multi-user desktop, and it is strictly tighter than 0666 besides.
+SocketGroup=pressured
+SocketUser=root
+# Accept=no (the default): systemd hands the daemon the LISTENING fd and the
+# daemon accepts on it. Accept=yes would spawn a unit instance per connection,
+# which is wrong for a daemon that holds cross-connection state.
+Accept=no
+# Nothing should be talking to this before the daemon is up, but if something
+# does, don't let a burst of connect attempts churn the service.
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

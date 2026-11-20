@@ -5,9 +5,13 @@ use std::thread;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{actions, cgroup, classify, guard, mitigate, notify, psi};
+use crate::{actions, cgroup, classify, guard, mitigate, psi};
 
 pub const SOCKET_PATH: &str = "/run/pressured.sock";
+/// Group allowed to talk to the control socket. Shared rather than per-user on
+/// purpose: a desktop can have more than one human logged in, and both of them
+/// have a session that needs to report focus and touches.
+pub const SOCKET_GROUP: &str = "pressured";
 const LIST_MIN_BYTES: u64 = 100 * 1024 * 1024; // surface apps >= 100 MB
 const CGROUP_BASE: &str = "/sys/fs/cgroup";
 
@@ -160,18 +164,83 @@ pub fn spawn_server() {
     });
 }
 
-fn serve() -> std::io::Result<()> {
+/// Take the listening socket systemd handed us, if we were socket-activated.
+///
+/// Returns None when run outside socket activation — `pressured daemon` from a
+/// terminal, the benchmarks, a pre-`pressured.socket` install — and the caller
+/// falls back to binding it itself.
+fn inherited_listener() -> Option<UnixListener> {
+    use std::os::fd::FromRawFd;
+    // LISTEN_PID is what makes this safe to read: systemd sets it to the pid it
+    // is activating, so an inherited copy of these variables from some ancestor
+    // cannot trick us into claiming an fd that isn't ours.
+    if std::env::var("LISTEN_PID").ok()?.parse::<u32>().ok()? != std::process::id() {
+        return None;
+    }
+    if std::env::var("LISTEN_FDS").ok()?.parse::<i32>().ok()? < 1 {
+        return None;
+    }
+    // Clear before returning: we runuser(1) out to gdbus for notifications, and
+    // a child that inherits LISTEN_PID/LISTEN_FDS may try to interpret fds that
+    // are meaningless to it.
+    std::env::remove_var("LISTEN_PID");
+    std::env::remove_var("LISTEN_FDS");
+    std::env::remove_var("LISTEN_FDNAMES");
+    // SD_LISTEN_FDS_START. The unit declares exactly one ListenStream=, so the
+    // first passed fd is our socket.
+    Some(unsafe { UnixListener::from_raw_fd(3) })
+}
+
+/// Bind the socket ourselves, for runs that aren't socket-activated.
+///
+/// The ownership rule here deliberately does NOT consult /run/user/*. It used
+/// to, and the failure that taught us otherwise is written up in
+/// `pressured.socket`: at boot there is no logged-in user to discover, the
+/// lookup returns None, the chown is skipped, and the socket stays root:root
+/// for the life of the daemon because this function runs exactly once. A named
+/// group is knowable at any time, including before anyone logs in.
+fn bind_socket() -> std::io::Result<UnixListener> {
     let _ = std::fs::remove_file(SOCKET_PATH);
     let listener = UnixListener::bind(SOCKET_PATH)?;
-
-    // Let the graphical user (by primary group) connect; keep everyone else out.
     std::fs::set_permissions(SOCKET_PATH, std::fs::Permissions::from_mode(0o660))?;
-    if let Some(uid) = notify::graphical_uid() {
-        if let Ok(Some(user)) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid)) {
-            let _ = nix::unistd::chown(SOCKET_PATH, None, Some(user.gid));
+
+    match nix::unistd::Group::from_name(SOCKET_GROUP) {
+        Ok(Some(group)) => {
+            if let Err(e) = nix::unistd::chown(SOCKET_PATH, None, Some(group.gid)) {
+                // Loud, because the daemon keeps running and every client will
+                // silently get EACCES. This line is the only trace such an
+                // outage leaves.
+                eprintln!(
+                    "ipc: WARNING could not chown {} to group {}: {} — focus reports \
+                     and session touches will be refused (EACCES) and both clients \
+                     fail quietly. Fix: install pressured.socket, or chgrp by hand.",
+                    SOCKET_PATH, SOCKET_GROUP, e
+                );
+            }
         }
+        _ => eprintln!(
+            "ipc: WARNING group '{}' does not exist — {} stays root-owned, so the \
+             GNOME focus reporter and `pressured ctl touch` will both be refused \
+             (EACCES) without surfacing an error. Fix: sudo groupadd -r {} and add \
+             your desktop users, or re-run install.sh.",
+            SOCKET_GROUP, SOCKET_PATH, SOCKET_GROUP
+        ),
     }
-    eprintln!("ipc: control socket listening at {}", SOCKET_PATH);
+    Ok(listener)
+}
+
+fn serve() -> std::io::Result<()> {
+    let listener = match inherited_listener() {
+        Some(l) => {
+            eprintln!("ipc: control socket inherited from systemd at {}", SOCKET_PATH);
+            l
+        }
+        None => {
+            let l = bind_socket()?;
+            eprintln!("ipc: control socket listening at {}", SOCKET_PATH);
+            l
+        }
+    };
 
     for stream in listener.incoming().flatten() {
         // One thread per connection: a slow/silent client can't wedge the socket
